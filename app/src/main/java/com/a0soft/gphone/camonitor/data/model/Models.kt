@@ -1,5 +1,6 @@
 package com.a0soft.gphone.camonitor.data.model
 
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -319,6 +320,34 @@ enum class NightModeSetting {
     NORMAL
 }
 
+/**
+ * Describes one physical camera exposed by the device.
+ *
+ * The camera side enumerates every usable lens via
+ * [androidx.camera.lifecycle.ProcessCameraProvider.availableCameraInfos] and publishes
+ * the resulting list to the viewer. The viewer then picks one of [id] at will.
+ *
+ * @param id stable identifier used on the wire (the Camera2 camera id).
+ * @param label human readable label, e.g. "0.5x" / "1x" / "2x" / "Front".
+ * @param lensFacing one of "back" / "front" / "external".
+ * @param focalLength35eq equivalent 35mm focal length in millimetres, used to derive the zoom label.
+ * @param zoomFactor relative zoom against the shortest back focal length.
+ * @param isDefault true for the lens the camera uses by default (the main back camera).
+ * @param mid WebRTC transceiver mid that carries this lens. Filled in by the camera
+ *   once the answer is negotiated, so the viewer can map a remote track back to a
+ *   physical lens without relying on ordering.
+ */
+data class CameraLensInfo(
+    val id: String,
+    val label: String,
+    val lensFacing: String,
+    val focalLength35eq: Float,
+    val zoomFactor: Float,
+    val isDefault: Boolean,
+    val available: Boolean = true,
+    val mid: String? = null
+)
+
 sealed class ControlCommand {
     data class Torch(val enabled: Boolean) : ControlCommand()
     data class TorchReport(val enabled: Boolean) : ControlCommand()
@@ -330,6 +359,30 @@ sealed class ControlCommand {
     data class SetNightMode(val mode: String) : ControlCommand()
     data class NightModeReport(val mode: String, val isNightActive: Boolean) : ControlCommand()
     data class FpsReport(val fps: Int) : ControlCommand()
+
+    /** Viewer asks the camera to switch the rendered lens. */
+    data class SwitchLens(val lensId: String) : ControlCommand()
+
+    /** Camera reports the lens list it loaded plus which one is currently selected. */
+    data class LensListReport(val lenses: List<CameraLensInfo>, val activeLensId: String) : ControlCommand()
+
+    /**
+     * Camera answers a [SwitchLens] request.
+     *
+     * Every request MUST be answered — including the ones the camera refuses
+     * ("that lens is already live", "another switch is running"). The viewer keeps
+     * the tapped lens in a pending state until it sees this reply or its own
+     * timeout fires, so a silent refusal leaves the button stuck forever.
+     *
+     * @param status OK / ALREADY_ACTIVE / BUSY / FAILED
+     * @param activeLensId lens actually streaming after the request
+     */
+    data class LensSwitchResult(
+        val lensId: String,
+        val status: String,
+        val activeLensId: String? = null,
+        val message: String? = null
+    ) : ControlCommand()
 
     fun toJson(): String {
         val json = JSONObject()
@@ -367,6 +420,35 @@ sealed class ControlCommand {
                 json.put("cmd", "FPS_REPORT")
                 json.put("fps", fps)
             }
+            is SwitchLens -> {
+                json.put("cmd", "SWITCH_LENS")
+                json.put("lensId", lensId)
+            }
+            is LensListReport -> {
+                json.put("cmd", "LENS_LIST_REPORT")
+                json.put("activeLensId", activeLensId)
+                json.put("lenses", JSONArray().apply {
+                    lenses.forEach { lens ->
+                        put(JSONObject().apply {
+                            put("id", lens.id)
+                            put("label", lens.label)
+                            put("facing", lens.lensFacing)
+                            put("focal35", lens.focalLength35eq.toDouble())
+                            put("zoom", lens.zoomFactor.toDouble())
+                            put("def", lens.isDefault)
+                            put("avail", lens.available)
+                            lens.mid?.let { put("mid", it) }
+                        })
+                    }
+                })
+            }
+            is LensSwitchResult -> {
+                json.put("cmd", "LENS_SWITCH_RESULT")
+                json.put("lensId", lensId)
+                json.put("status", status)
+                activeLensId?.let { json.put("activeLensId", it) }
+                message?.let { json.put("message", it) }
+            }
         }
         return json.toString()
     }
@@ -392,11 +474,43 @@ sealed class ControlCommand {
                         isNightActive = json.optBoolean("active", false)
                     )
                     "FPS_REPORT" -> FpsReport(fps = json.getInt("fps"))
+                    "SWITCH_LENS" -> SwitchLens(lensId = json.getString("lensId"))
+                    "LENS_LIST_REPORT" -> LensListReport(
+                        activeLensId = json.optString("activeLensId"),
+                        lenses = parseLensArray(json.optJSONArray("lenses"))
+                    )
+                    "LENS_SWITCH_RESULT" -> LensSwitchResult(
+                        lensId = json.optString("lensId"),
+                        status = json.optString("status", "FAILED"),
+                        activeLensId = json.optString("activeLensId").takeIf { it.isNotEmpty() },
+                        message = json.optString("message").takeIf { it.isNotEmpty() }
+                    )
                     else -> null
                 }
             } catch (e: Exception) {
                 null
             }
+        }
+
+        private fun parseLensArray(arr: JSONArray?): List<CameraLensInfo> {
+            if (arr == null) return emptyList()
+            val out = mutableListOf<CameraLensInfo>()
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                out.add(
+                    CameraLensInfo(
+                        id = o.optString("id"),
+                        label = o.optString("label"),
+                        lensFacing = o.optString("facing", "back"),
+                        focalLength35eq = o.optDouble("focal35", 0.0).toFloat(),
+                        zoomFactor = o.optDouble("zoom", 1.0).toFloat(),
+                        isDefault = o.optBoolean("def", false),
+                        available = o.optBoolean("avail", true),
+                        mid = o.optString("mid").takeIf { it.isNotEmpty() }
+                    )
+                )
+            }
+            return out
         }
     }
 }
@@ -412,11 +526,43 @@ data class LogEntry(
     val timestamp: Long,
     val level: LogLevel,
     val tag: String,
-    val message: String
+    val message: String,
+    /**
+     * Milliseconds since process start.
+     *
+     * Wall-clock time alone is not trustworthy here: roaming between campus
+     * subnets triggers an NTP correction, and a jump backwards makes the log
+     * timeline read as if events happened out of order. The monotonic offset is
+     * immune to that, so a stall or a gap can still be measured accurately.
+     */
+    val elapsedMs: Long = 0L,
+    /**
+     * Name of the thread that emitted the line.
+     *
+     * This is the single most useful field when diagnosing a freeze — without it
+     * "the main thread was busy" can only be inferred indirectly from a timeout
+     * message somewhere else in the log.
+     */
+    val thread: String = ""
 ) {
     fun format(): String {
-        val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US)
-        val time = sdf.format(java.util.Date(timestamp))
-        return "[$time] [${level.name}] [$tag] $message"
+        val time = FORMATTER.get()!!.format(java.util.Date(timestamp))
+        val rel = String.format(java.util.Locale.US, "%.1fs", elapsedMs / 1000.0)
+        val threadPart = if (thread.isEmpty()) "" else " {$thread}"
+        return "[$time +$rel] [${level.name}] [$tag]$threadPart $message"
+    }
+
+    companion object {
+        /**
+         * SimpleDateFormat is not thread-safe and constructing one per line was
+         * measurably wasteful (every one of the ~400 call sites paid for it).
+         * A ThreadLocal keeps one instance per writer thread instead.
+         */
+        private val FORMATTER = object : ThreadLocal<java.text.SimpleDateFormat>() {
+            override fun initialValue() = java.text.SimpleDateFormat(
+                "yyyy-MM-dd HH:mm:ss.SSS",
+                java.util.Locale.US
+            )
+        }
     }
 }

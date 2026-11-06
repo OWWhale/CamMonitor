@@ -13,6 +13,7 @@ import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Range
 import android.util.Size
 import android.view.Display
@@ -51,12 +52,40 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class CameraXVideoCapturer(
     private val context: Context,
-    private val preferNightMode: Boolean = true
+    private val preferNightMode: Boolean = true,
+    /**
+     * Camera2 id of the physical lens this capturer drives.
+     *
+     * When null the capturer falls back to the default back camera. When set, the
+     * capturer binds exactly that lens, which is what lets several capturers run
+     * in parallel — one per physical lens.
+     */
+    private val targetCameraId: String? = null,
+
+    /**
+     * Whether the NIGHT CameraX extension may be applied to this lens.
+     *
+     * ExtensionsManager builds an extension-enabled selector from the base
+     * selector; on many devices it only supports the main back camera and throws
+     * (or silently drops the CameraFilter) for ultra-wide / tele / front lenses.
+     * Enabling it on every lens would make all secondary lenses fail to bind as
+     * soon as night mode is active, so LensStreamController enables it only on the
+     * default lens.
+     */
+    private val allowNightExtension: Boolean = true
 ) : VideoCapturer {
 
     companion object {
-        const val LUX_THRESHOLD_NIGHT_ENTER = 10.0f
-        const val LUX_THRESHOLD_NIGHT_EXIT = 25.0f
+        /**
+         * Ambient light at which the NIGHT pipeline kicks in.
+         *
+         * Raised from 10 lx to 5 lx: the CameraX NIGHT extension combines several
+         * exposures per frame, which is the single hottest thing the camera can do
+         * on this hardware. A typical dim room sits at 10-30 lx and used to keep
+         * the extension engaged all night; now it only engages in near-darkness.
+         */
+        const val LUX_THRESHOLD_NIGHT_ENTER = 5.0f
+        const val LUX_THRESHOLD_NIGHT_EXIT = 15.0f
         const val LIGHT_DEBOUNCE_DELAY_MS = 1500L
 
         fun selectClosestFps(
@@ -94,7 +123,55 @@ class CameraXVideoCapturer(
         }
     }
 
-    private val tag = "CameraXVideoCapturer"
+    /** Diagnostic: counts frames delivered by CameraX into the WebRTC source. */
+    private val capturedFrameCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /**
+     * Number of frames this lens has handed to WebRTC so far.
+     *
+     * Exposed so [LensStreamController] can tell a lens that merely *bound* from
+     * one that is actually delivering pictures. A bound-but-silent lens is the
+     * "connected, audio only, black screen" case.
+     */
+    val framesCaptured: Int get() = capturedFrameCount.get()
+
+    /**
+     * When CameraX actually handed us a surface, in elapsed-realtime millis.
+     *
+     * `startCapture()` returning true only means the session was *bound*; the
+     * surface arrives later, on the main thread, through the surface-provider
+     * callback. If the main thread is blocked that callback never runs, the
+     * session stays bound with no frames, and the only symptom is a black screen
+     * ten seconds later. Tracking the timestamp lets the controller fail fast
+     * and say "no surface" instead of "no frames".
+     */
+    @Volatile
+    var surfaceGrantedAt: Long = 0L
+        private set
+
+    val isSurfaceGranted: Boolean get() = surfaceGrantedAt > 0L
+
+    /**
+     * Blocks the caller (a lens-worker thread, never the main thread) until the
+     * surface arrives or [timeoutMs] elapses.
+     */
+    fun awaitSurface(timeoutMs: Long): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (surfaceGrantedAt > 0L) return true
+            if (!isCapturing.get()) return false
+            try {
+                Thread.sleep(50L)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
+        return surfaceGrantedAt > 0L
+    }
+
+    /** Tagged with the lens id so multi-lens logs are attributable. */
+    private val tag = "CameraXVideoCapturer" + (targetCameraId?.let { "[$it]" } ?: "")
     private val mainHandler = Handler(Looper.getMainLooper())
 
     var finalFps: Int = 20
@@ -279,6 +356,11 @@ class CameraXVideoCapturer(
             // Start WebRTC listening to incoming OpenGL texture frames
             helper.stopListening()
             helper.startListening { videoFrame ->
+                val n = capturedFrameCount.incrementAndGet()
+                if (n == 1 || n % 100 == 0) {
+                    AppLogger.i(tag, "CameraX frames delivered: $n " +
+                        "(${videoFrame.buffer.width}x${videoFrame.buffer.height}, rot=${videoFrame.rotation})")
+                }
                 val texBuffer = videoFrame.buffer as? TextureBufferImpl
                 if (texBuffer != null) {
                     val (texRot, frameRot) = when (currentTargetRotation) {
@@ -310,8 +392,13 @@ class CameraXVideoCapturer(
                 }
             }
 
-            val baseSelector = CameraSelector.DEFAULT_BACK_CAMERA
-            val nightSupported = extManager.isExtensionAvailable(baseSelector, ExtensionMode.NIGHT)
+            val baseSelector = resolveTargetSelector(provider)
+            // Secondary lenses must not go through ExtensionsManager: on most
+            // devices NIGHT is only implemented for the main back camera and
+            // would either throw or silently discard our Camera2 id filter.
+            val nightSupported = allowNightExtension &&
+                runCatching { extManager.isExtensionAvailable(baseSelector, ExtensionMode.NIGHT) }
+                    .getOrDefault(false)
             this.isNightExtensionSupported = nightSupported
 
             capturerLifecycleOwner.start()
@@ -345,39 +432,105 @@ class CameraXVideoCapturer(
         }
     }
 
+    /**
+     * Builds the [CameraSelector] for this capturer.
+     *
+     * When a specific physical lens was requested we build a selector that matches
+     * exactly that Camera2 id, so several capturers can hold different lenses at the
+     * same time. Otherwise we fall back to the default back camera.
+     */
+    private fun resolveTargetSelector(provider: ProcessCameraProvider): CameraSelector {
+        val wantedId = targetCameraId ?: return CameraSelector.DEFAULT_BACK_CAMERA
+        val infos = provider.availableCameraInfos
+        val bindable = infos.mapNotNull { cameraIdOf(it) }
+        if (wantedId !in bindable) {
+            // NEVER fall back to DEFAULT_BACK_CAMERA here. In multi-lens mode that
+            // silently binds several "different" lenses to the same main camera:
+            // the viewer gets N identical streams and the HAL hits a concurrent
+            // open conflict. Throwing lets proceedStartSession() report this lens
+            // as unavailable through onCameraError so it is hidden from the viewer.
+            throw IllegalArgumentException(
+                "cameraId=$wantedId is not bindable by CameraX (available=$bindable)"
+            )
+        }
+        return CameraSelector.Builder()
+            .addCameraFilter { candidates -> candidates.filter { cameraIdOf(it) == wantedId } }
+            .build()
+    }
+
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun cameraIdOf(info: androidx.camera.core.CameraInfo): String? = runCatching {
+        androidx.camera.camera2.interop.Camera2CameraInfo.from(info).cameraId
+    }.getOrNull()
+
     private fun bindCameraSession(enableNight: Boolean) {
+        // A queued bind (night-mode switch, delayed lux runnable) must never run
+        // after the capturer was stopped — it would re-open the sensor behind the
+        // lens controller's back and fight the next lens for the hardware.
+        if (!isCapturing.get()) {
+            AppLogger.w(tag, "bindCameraSession skipped: capturer is not capturing")
+            return
+        }
+        // Every bind gets a fresh surface: if the previous one was granted and
+        // this bind never produces a new one, the stale timestamp would make the
+        // watchdog believe the pipeline is healthy.
+        surfaceGrantedAt = 0L
         val provider = cameraProvider ?: return
         val extManager = extensionsManager ?: return
         val helper = surfaceTextureHelper ?: return
 
-        val baseSelector = CameraSelector.DEFAULT_BACK_CAMERA
+        val baseSelector = resolveTargetSelector(provider)
         val targetSelector: CameraSelector
         val actuallyNight: Boolean
 
         if (enableNight) {
             if (isNightExtensionSupported) {
-                targetSelector = extManager.getExtensionEnabledCameraSelector(baseSelector, ExtensionMode.NIGHT)
-                AppLogger.i(tag, "Binding CameraX with ExtensionMode.NIGHT")
+                // getExtensionEnabledCameraSelector() can still throw for a
+                // selector carrying a custom CameraFilter even when
+                // isExtensionAvailable() returned true. Degrade to the plain
+                // selector rather than failing the whole lens bind.
+                targetSelector = runCatching {
+                    extManager.getExtensionEnabledCameraSelector(baseSelector, ExtensionMode.NIGHT)
+                }.getOrElse { e ->
+                    AppLogger.w(tag, "NIGHT extension selector failed (cameraId=$targetCameraId): ${e.message}; using standard selector")
+                    baseSelector
+                }
+                AppLogger.i(tag, "Binding CameraX with ExtensionMode.NIGHT (cameraId=$targetCameraId)")
             } else {
                 targetSelector = baseSelector
-                AppLogger.i(tag, "Binding CameraX with Standard CameraSelector (applying Camera2 low-light fallback)")
+                AppLogger.i(tag, "Binding CameraX with Standard CameraSelector (applying Camera2 low-light fallback) (cameraId=$targetCameraId)")
             }
             actuallyNight = true
         } else {
             targetSelector = baseSelector
             actuallyNight = false
-            AppLogger.i(tag, "Binding CameraX with Standard CameraSelector (Normal mode)")
+            AppLogger.i(tag, "Binding CameraX with Standard CameraSelector (Normal mode) (cameraId=$targetCameraId)")
         }
 
-        val isLandscape = currentTargetRotation == Surface.ROTATION_90 || currentTargetRotation == Surface.ROTATION_270
-        val boundWidth = if (isLandscape) maxOf(lastWidth, lastHeight) else minOf(lastWidth, lastHeight)
-        val boundHeight = if (isLandscape) minOf(lastWidth, lastHeight) else maxOf(lastWidth, lastHeight)
+        // CameraX expresses resolutions in SENSOR coordinates, which are always
+        // landscape (1280x720, 1920x1080…). They have nothing to do with how the
+        // phone is held: swapping for portrait produces Size(720,1280), which
+        // matches no 16:9 candidate, so CLOSEST_LOWER_THEN_HIGHER silently falls
+        // back to 640x360 — or even 192x108 — and the whole stream turns to mush
+        // while every log line still says "720p".
+        //
+        // Only normalise width >= height so an upside-down caller cannot poison
+        // the request; the on-screen orientation is applied via targetRotation.
+        val targetWidth = maxOf(lastWidth, lastHeight)
+        val targetHeight = minOf(lastWidth, lastHeight)
 
         val resolutionSelector = ResolutionSelector.Builder()
             .setResolutionStrategy(
                 ResolutionStrategy(
-                    Size(boundWidth, boundHeight),
-                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                    Size(targetWidth, targetHeight),
+                    // CLOSEST_HIGHER_THEN_LOWER made CameraX pick the sensor's
+                    // maximum (3264x1840 on this device). With several lenses
+                    // open at once that is ~11 MP of preview per frame and the
+                    // ISP/encoder starves: the video track stays LIVE but never
+                    // delivers a frame. The stream is capped at 720p by
+                    // VideoSource.adaptOutputFormat anyway, so a larger preview
+                    // only burns bandwidth and hardware capacity.
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
                 )
             )
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
@@ -388,26 +541,48 @@ class CameraXVideoCapturer(
             .setResolutionSelector(resolutionSelector)
 
         val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
-        val backCameraId = cameraManager?.cameraIdList?.firstOrNull { id ->
+        // Use THIS capturer's lens characteristics. Reading the first back camera
+        // would apply the main camera's AE ranges to a telephoto lens, which does
+        // not expose the same frame rate options.
+        val characteristicsId = targetCameraId ?: cameraManager?.cameraIdList?.firstOrNull { id ->
             val chars = cameraManager.getCameraCharacteristics(id)
             chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
         } ?: "0"
-        val chars = cameraManager?.getCameraCharacteristics(backCameraId)
+        val chars = try {
+            cameraManager?.getCameraCharacteristics(characteristicsId)
+        } catch (e: Exception) {
+            AppLogger.w(tag, "Cannot read characteristics for camera $characteristicsId: ${e.message}")
+            null
+        }
         val availableFpsRanges = chars?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
         val selectedFpsRange = selectClosestSupportedFpsRange(availableFpsRanges, lastFramerate)
-        finalFps = selectedFpsRange.upper
+        // The closest range is usually something like [15,30] whose UPPER bound is
+        // 30 — using it as-is made the sensor run at 30 fps even though the caller
+        // asked for 20, paying ~50% more ISP + encoder power for frames the
+        // encoder then drops. Cap the upper bound at the requested rate instead.
+        val cappedUpper = selectedFpsRange.upper
+            .coerceAtMost(lastFramerate)
+            .coerceAtLeast(selectedFpsRange.lower)
+        val effectiveFpsRange = Range(selectedFpsRange.lower, cappedUpper)
+        finalFps = cappedUpper
         _streamFpsFlow.value = finalFps
         onFpsDetermined?.invoke(finalFps)
-        AppLogger.i(tag, "Selected hardware AE FPS range: $selectedFpsRange, finalFps=$finalFps (target=$lastFramerate)")
+        AppLogger.i(tag, "Selected hardware AE FPS range: $selectedFpsRange -> $effectiveFpsRange, " +
+            "finalFps=$finalFps (target=$lastFramerate)")
 
         if (enableNight && !isNightExtensionSupported) {
             AppLogger.i(tag, "Applying Camera2 low-light fallback")
-            configureLowLightFallback(previewBuilder, chars, selectedFpsRange)
+            configureLowLightFallback(previewBuilder, chars, effectiveFpsRange)
         } else {
-            previewBuilder.setTargetFpsRange(selectedFpsRange)
+            previewBuilder.setTargetFpsRange(effectiveFpsRange)
         }
 
         val newPreview = previewBuilder.build()
+        // Remember the PREVIOUS preview before overwriting the field. The unbind
+        // below must target the session that is actually bound to the camera —
+        // unbinding the new (not yet bound) preview would leave the old session
+        // holding the hardware, which breaks concurrent multi-lens capture.
+        val previousPreview = this.preview
         this.preview = newPreview
 
         val mainExecutor = ContextCompat.getMainExecutor(context)
@@ -417,7 +592,9 @@ class CameraXVideoCapturer(
                 return@setSurfaceProvider
             }
             val res = request.resolution
-            AppLogger.i(tag, "CameraX Surface requested: ${res.width}x${res.height} (night=$enableNight)")
+            surfaceGrantedAt = SystemClock.elapsedRealtime()
+            AppLogger.i(tag, "CameraX Surface granted: ${res.width}x${res.height} " +
+                "(requested=${targetWidth}x${targetHeight}, night=$enableNight)")
             helper.setTextureSize(res.width, res.height)
             val surfaceTexture = helper.surfaceTexture
             surfaceTexture.setDefaultBufferSize(res.width, res.height)
@@ -439,7 +616,19 @@ class CameraXVideoCapturer(
             }
         }
 
-        provider.unbindAll()
+        // Unbind ONLY our own use case.
+        //
+        // IMPORTANT: never call provider.unbindAll() here — when several lenses run
+        // in parallel (one capturer per physical camera) that would tear down every
+        // other lens' session as well. Unbinding the specific Preview instance keeps
+        // the sibling lenses alive.
+        previousPreview?.let { oldPreview ->
+            try {
+                provider.unbind(oldPreview)
+            } catch (e: Exception) {
+                AppLogger.w(tag, "Failed unbinding previous preview: ${e.message}")
+            }
+        }
         camera = provider.bindToLifecycle(capturerLifecycleOwner, targetSelector, newPreview)
         _isNightModeActiveFlow.value = actuallyNight
         onNightModeChanged?.invoke(actuallyNight)
@@ -447,7 +636,8 @@ class CameraXVideoCapturer(
         if (isTorchActive) {
             camera?.cameraControl?.enableTorch(true)
         }
-        AppLogger.i(tag, "Camera session bound: nightActive=$actuallyNight (supported=$isNightExtensionSupported, bound=${boundWidth}x${boundHeight})")
+        AppLogger.i(tag, "Camera session bound: nightActive=$actuallyNight " +
+            "(supported=$isNightExtensionSupported, requested=${targetWidth}x${targetHeight})")
     }
 
     private fun startLightMonitoring() {
@@ -669,7 +859,14 @@ class CameraXVideoCapturer(
         val stopRunnable = Runnable {
             try {
                 capturerLifecycleOwner.stop()
-                cameraProvider?.unbindAll()
+                // Unbind only our own preview so sibling lenses keep running.
+                preview?.let { p ->
+                    try {
+                        cameraProvider?.unbind(p)
+                    } catch (e: Exception) {
+                        AppLogger.w(tag, "Failed unbinding preview on stop: ${e.message}")
+                    }
+                }
                 camera = null
                 preview = null
 
@@ -699,7 +896,11 @@ class CameraXVideoCapturer(
                 }
             }
             try {
-                latch.await(2, TimeUnit.SECONDS)
+                if (!latch.await(3, TimeUnit.SECONDS)) {
+                    // The camera thread is stuck (usually a slow HAL teardown).
+                    // Report it instead of blocking the caller any longer.
+                    AppLogger.w(tag, "stopCapture timed out waiting for the main thread")
+                }
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
@@ -713,7 +914,14 @@ class CameraXVideoCapturer(
         }
     }
 
+    /** Guards against the double-dispose that used to freeze the main thread. */
+    private val disposed = AtomicBoolean(false)
+
     override fun dispose() {
+        if (!disposed.compareAndSet(false, true)) {
+            AppLogger.w(tag, "dispose() called twice — ignoring the second call")
+            return
+        }
         captureSessionToken.incrementAndGet()
         stopCapture()
         if (Looper.myLooper() == Looper.getMainLooper()) {

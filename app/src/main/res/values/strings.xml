@@ -50,10 +50,11 @@
     <string name="camera_viewers_count">%1$d/%2$d Viewers</string>
     <string name="camera_viewers_count_short">%1$d/%2$d</string>
     <string name="camera_intercom_live">Intercom Live (Viewer Speaking)</string>
+    <string name="camera_unlock_hint">Swipe to unlock</string>
     <string name="camera_black_screen">Black Screen</string>
     <string name="camera_exit_button">Exit Camera</string>
     <string name="camera_paused_title">Camera Paused</string>
-    <string name="camera_paused_description">No viewers connected for 1 minute. Camera sensor stopped to preserve battery. Standby mode active — camera will automatically wake up when a viewer connects.</string>
+    <string name="camera_paused_description">No viewers connected for 15 seconds. Camera sensor stopped to preserve battery. Standby mode active — camera will automatically wake up when a viewer connects.</string>
 
     <!-- Viewer Mode Screen -->
     <string name="camera_default_name">Camera</string>
@@ -106,14 +107,18 @@
     <string name="cd_pairing_qr_code">Pairing QR Code</string>
     <string name="camera_pairing_otp_expires">OTP expires in %1$02d:%2$02d</string>
     <string name="camera_pairing_slot_available">Slot %1$d of %2$d Available</string>
+    <string name="camera_pairing_external_addr_label">Cross-subnet address (optional)</string>
+    <string name="camera_pairing_external_addr_hint">Leave empty for LAN only. Local address: %1$s</string>
+    <string name="camera_pairing_external_addr_in_use">QR will also carry %1$s</string>
+    <string name="camera_pairing_external_addr_invalid">Use host:port, e.g. 10.20.30.40:5577</string>
     <string name="camera_pairing_instructions">Open CamMonitor on Device B, tap \'Start Viewer Mode\' and scan this code.</string>
 
     <!-- Viewer Pairing Screen -->
     <string name="viewer_pairing_title">Scan Camera QR Code</string>
     <string name="viewer_pairing_align_qr">Align QR code within the frame to pair</string>
     <string name="viewer_pairing_invalid_qr">Invalid CamMonitor QR code format</string>
-    <string name="viewer_pairing_connecting_broker">Valid QR detected. Connecting to signaling broker...</string>
-    <string name="viewer_pairing_broker_failed">Broker connection failed. Retrying...</string>
+    <string name="viewer_pairing_connecting_broker">Valid QR detected. Connecting to camera directly (LAN)...</string>
+    <string name="viewer_pairing_broker_failed">Camera connection failed. Retrying...</string>
     <string name="viewer_pairing_authenticating">Authenticating with %1$s...</string>
     <string name="viewer_pairing_success">Pairing successful! Starting viewer...</string>
     <string name="viewer_pairing_timeout">Pairing timed out. Align QR code again to retry.</string>
@@ -134,12 +139,15 @@
     <!-- Log Viewer Screen -->
     <string name="log_share_title">Share CamMonitor Logs</string>
     <string name="log_share_description">Share Logs</string>
+    <string name="log_level_verbose">Verbose logging is on (includes debug)</string>
+    <string name="log_level_normal">Standard logging (tap for verbose)</string>
     <string name="log_clear_description">Clear Logs</string>
     <string name="log_filter_all">ALL</string>
 
     <!-- Language Picker -->
     <string name="language_picker_title">App Language</string>
     <string name="language_system_default">System Default</string>
+    <string name="language_simplified_chinese">简体中文</string>
     <string name="language_english">English</string>
     <string name="language_traditional_chinese">繁體中文 (台灣)</string>
     <string name="language_japanese">日本語</string>
@@ -166,4 +174,34 @@
     <string name="permission_notification_reason">Notifications: Required to keep camera monitoring running in the background.</string>
     <string name="permission_open_settings">Open Settings</string>
     <string name="permission_grant">Grant</string>
+    <!-- Network & signaling settings (LAN-first fork) -->
+    <string name="settings_title">Network Settings</string>
+    <string name="settings_signaling_mode">Signaling Mode</string>
+    <string name="settings_mode_lan">LAN Direct (recommended)</string>
+    <string name="settings_mode_lan_desc">Devices exchange signaling directly over the local network. No internet required. Both devices must be on the same Wi-Fi / hotspot with AP isolation disabled.</string>
+    <string name="settings_mode_mqtt">MQTT Relay</string>
+    <string name="settings_mode_mqtt_desc">Routes signaling through an MQTT broker. Works across networks, but requires a reachable broker (import your own below).</string>
+    <string name="settings_lan_section">LAN Direct</string>
+    <string name="settings_local_ip">This device: %1$s</string>
+    <string name="settings_unknown_ip">address unavailable</string>
+    <string name="settings_refresh">Refresh</string>
+    <string name="settings_lan_port">LAN listening port</string>
+    <string name="settings_save">Save</string>
+    <string name="settings_lan_hint">If discovery fails, disable AP isolation on your router, or enter the camera address manually below.</string>
+    <string name="settings_manual_camera_addr">Manual Camera Address</string>
+    <string name="settings_camera_addr_label">%1$s address</string>
+    <string name="settings_manual_addr_hint">Enter host:port, or two addresses separated by a comma: local first, cross-subnet second (e.g. 192.168.11.114:5577,10.20.30.40:5577). Used when automatic discovery is unavailable.</string>
+    <string name="settings_mqtt_section">MQTT Relay Broker</string>
+    <string name="settings_mqtt_host">Broker host</string>
+    <string name="settings_mqtt_port">Broker port</string>
+    <string name="settings_mqtt_tls">Use TLS</string>
+    <string name="settings_mqtt_user">Username (optional)</string>
+    <string name="settings_mqtt_pass">Password (optional)</string>
+    <string name="settings_ice_section">STUN / TURN Servers</string>
+    <string name="settings_ice_import_hint">No servers are built in. Import your own (self-hosted coturn or your provider) as JSON — { iceServers: [ { urls: [stun:host:port] }, { urls: [turn:host:port], username: u, credential: p } ], mqtt: { host: broker.example.net, port: 8883, tls: true } }</string>
+    <string name="settings_ice_import">Import</string>
+    <string name="settings_ice_imported">Imported successfully</string>
+    <string name="settings_ice_import_failed">Import failed: invalid JSON</string>
+    <string name="settings_ice_empty">No STUN/TURN servers configured. LAN direct mode does not need any; relay mode may need them to traverse NAT.</string>
+    <string name="settings_ice_clear">Clear</string>
 </resources>

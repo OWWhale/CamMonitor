@@ -5,6 +5,7 @@ import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.os.SystemClock
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.Settings
@@ -23,6 +24,8 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -35,6 +38,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
@@ -46,18 +50,21 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.a0soft.gphone.camonitor.CamMonitorApp
 import com.a0soft.gphone.camonitor.R
+import com.a0soft.gphone.camonitor.data.model.CameraLensInfo
 import com.a0soft.gphone.camonitor.data.model.ControlCommand
 import com.a0soft.gphone.camonitor.data.model.NightModeSetting
 import com.a0soft.gphone.camonitor.data.model.SignalingMessage
 import com.a0soft.gphone.camonitor.data.model.ViewerConnectionProgress
 import com.a0soft.gphone.camonitor.data.model.ViewerConnectionStep
 import com.a0soft.gphone.camonitor.data.security.CryptoUtils
+import com.a0soft.gphone.camonitor.data.webrtc.MultiLensConstants
 import com.a0soft.gphone.camonitor.log.AppLogger
 import com.a0soft.gphone.camonitor.ui.common.AudioRoutingManager
 import com.a0soft.gphone.camonitor.ui.common.BatteryHelper
 import com.a0soft.gphone.camonitor.ui.common.BatteryInfo
 import com.a0soft.gphone.camonitor.ui.theme.StatusLive
 import androidx.compose.ui.text.font.FontWeight
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -149,6 +156,9 @@ fun ViewerModeScreen(
             securityRepo.recordConnectDurationMs(cam.deviceId, totalDur)
         }
         connectionState = ViewerConnectionState.Live
+        if (!hasRenderedFirstFrame) {
+            AppLogger.w("ViewerMode", "Marked LIVE via fallback WITHOUT a rendered first frame — video is likely black")
+        }
         AppLogger.i("ViewerMode", "Stream transitioned to LIVE (totalConnectDuration=${totalDur}ms)")
     }
     var isAudioEnabled by remember { mutableStateOf(securityRepo.isViewerAudioPlaybackEnabled()) }
@@ -158,7 +168,68 @@ fun ViewerModeScreen(
     var nightModeSetting by remember { mutableStateOf(securityRepo.getNightModeSetting()) }
     var isCameraNightActive by remember { mutableStateOf(false) }
 
+    // Multi-lens state: the lens list published by the camera and the lens the
+    // viewer currently renders.
+    var availableLenses by remember { mutableStateOf<List<CameraLensInfo>>(emptyList()) }
+    val activeLensId by webRtcManager.activeLensId.collectAsState()
+
     val context = LocalContext.current
+
+    // Pending lens switch. The camera answers every request, but the DataChannel
+    // can drop or the sensor can hang, so a local timeout is the only thing that
+    // guarantees the UI never gets stuck greyed out.
+    var pendingLensId by remember { mutableStateOf<String?>(null) }
+    var lensSwitchTimeoutJob by remember { mutableStateOf<Job?>(null) }
+    val lensScope = rememberCoroutineScope()
+
+    fun settleLensSwitch(lensId: String?, reason: String) {
+        lensSwitchTimeoutJob?.cancel()
+        lensSwitchTimeoutJob = null
+        if (pendingLensId != null) {
+            AppLogger.i("ViewerMode", "Lens switch settled (${pendingLensId}) by $reason")
+        }
+        pendingLensId = null
+        if (lensId != null) {
+            AppLogger.i("ViewerMode", "Lens switch result: $lensId / $reason")
+        }
+    }
+
+    /**
+     * Asks the camera to switch sensors and keeps the button pending until it
+     * answers (LENS_SWITCH_RESULT / LENS_LIST_REPORT) or 4s elapse.
+     */
+    fun switchLens(lensId: String) {
+        if (pendingLensId != null) {
+            AppLogger.i("ViewerMode", "Lens switch ignored: ${pendingLensId} is still pending")
+            return
+        }
+        val cam = targetCamera ?: return
+
+        pendingLensId = lensId
+        // Harmless on a single-track camera (returns false: no such mid track),
+        // but required when the peer still publishes one track per lens.
+        webRtcManager.selectRemoteLens(lensId)
+
+        val sent = webRtcManager.sendDataChannelCommand(cam.deviceId, ControlCommand.SwitchLens(lensId))
+        if (!sent) {
+            settleLensSwitch(lensId, "datachannel not open")
+            android.widget.Toast.makeText(context, "控制通道未就绪，请稍后重试", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        AppLogger.i("ViewerMode", "Requested lens switch to $lensId")
+
+        lensSwitchTimeoutJob?.cancel()
+        lensSwitchTimeoutJob = lensScope.launch {
+            // Longer than the camera's own first-frame budget (4s): a timeout
+            // here must mean "really no answer", not "slow sensor".
+            delay(6_000L)
+            if (pendingLensId == lensId) {
+                AppLogger.w("ViewerMode", "Lens switch to $lensId timed out after 6s (no answer from camera)")
+                pendingLensId = null
+                android.widget.Toast.makeText(context, "镜头切换超时", android.widget.Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
     val activity = context as? Activity
     val prefs = remember { context.getSharedPreferences("cammonitor_prefs", Context.MODE_PRIVATE) }
     var showMicPermissionDialog by remember { mutableStateOf(false) }
@@ -184,6 +255,20 @@ fun ViewerModeScreen(
         }
     }
 
+    // Entering the viewer starts a connection immediately, but the local audio
+    // track only exists a few hundred milliseconds later. ON_RESUME lands inside
+    // that window, saw `!isViewerAudioTrackActive`, and bumped reconnectTrigger —
+    // tearing down the PeerConnection that had just been created and building a
+    // second one. That is where the duplicate Offer/Answer pair came from. The
+    // timestamp below makes the resume path stand down while a connect is still
+    // in its own startup phase.
+    val lastConnectStartedAt = remember { java.util.concurrent.atomic.AtomicLong(0L) }
+
+    // Monotonic id of the connection attempt, echoed by the camera on the Answer.
+    // An Answer from a connection we already gave up on is structurally
+    // indistinguishable from the current one, so without this a late Answer can
+    // be applied to a freshly created PeerConnection.
+
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -191,7 +276,8 @@ fun ViewerModeScreen(
                 val hasMic = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
                 if (hasMic) {
                     showMicPermissionDialog = false
-                    if (!webRtcManager.isViewerAudioTrackActive) {
+                    val sinceStart = SystemClock.elapsedRealtime() - lastConnectStartedAt.get()
+                    if (!webRtcManager.isViewerAudioTrackActive && sinceStart > 2_000L) {
                         reconnectTrigger++
                     }
                 }
@@ -235,8 +321,10 @@ fun ViewerModeScreen(
     }
 
     // Auto-hide controls timer
-    LaunchedEffect(isControlsVisible) {
-        if (isControlsVisible) {
+    LaunchedEffect(isControlsVisible, availableLenses.size) {
+        // With multiple lenses the switcher has to stay reachable. Hiding the
+        // whole overlay after 5s made it look as if lens switching did not exist.
+        if (isControlsVisible && availableLenses.size <= 1) {
             delay(5000L)
             isControlsVisible = false
         }
@@ -250,7 +338,11 @@ fun ViewerModeScreen(
     }
 
     // Connect to camera on launch and on reconnectTrigger
-    LaunchedEffect(targetCamera, reconnectTrigger) {
+    // Keyed by deviceId, not by the object: the repository hands out a fresh
+    // PairedDevice instance whenever anything about it changes (name, address,
+    // last-seen), and a changing object identity restarted this whole effect —
+    // another PeerConnection, another Offer. The device is the same device.
+    LaunchedEffect(targetCamera?.deviceId, reconnectTrigger) {
         val effectScope = this
         if (targetCamera == null) {
             connectionState = ViewerConnectionState.NoCamera
@@ -259,6 +351,7 @@ fun ViewerModeScreen(
         }
         if (isUserExited) return@LaunchedEffect
 
+        lastConnectStartedAt.set(SystemClock.elapsedRealtime())
         webRtcManager.closePeer(targetCamera.deviceId)
         surfaceRenderer?.let { webRtcManager.attachRemoteRenderer(it) }
         val startTime = System.currentTimeMillis()
@@ -289,14 +382,36 @@ fun ViewerModeScreen(
 
         val localIceCandidates = java.util.concurrent.CopyOnWriteArrayList<IceCandidate>()
 
+        /**
+         * candidate key -> true once the camera acknowledged the send.
+         *
+         * A candidate used to be transmitted two or three times: once from the
+         * gatherer callback, once on every Offer retry, and once more - all of
+         * them, unconditionally - when the Answer arrived. That was 48 candidates
+         * re-sent three times per connection, most of a reconnect's signalling
+         * traffic. The callback already delivers them; the only ones that need
+         * re-sending are those whose first attempt failed while the TCP socket was
+         * still being established.
+         */
+        val candidateDelivered = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+        fun candidateKeyOf(c: IceCandidate) =
+            "${c.sdpMid}:${c.sdpMLineIndex}:${c.sdp}"
+
         val pc = webRtcManager.createPeerConnection(targetCamera.deviceId) { candidate ->
-            val typeMatch = Regex("typ\\s+(\\w+)").find(candidate.sdp)?.groupValues?.getOrNull(1) ?: "unknown"
-            AppLogger.d("ViewerMode", "Forwarding local ICE candidate to camera: mid=${candidate.sdpMid}, type=$typeMatch")
-            localIceCandidates.add(candidate)
-            val iceMsg = SignalingMessage.IceCandidate(candidate.sdpMid, candidate.sdpMLineIndex, candidate.sdp)
-            effectScope.launch {
-                val sent = signalingClient.sendSignalingMessage(targetCamera.deviceId, iceMsg, sharedKey)
-                AppLogger.d("ViewerMode", "Sent ICE candidate to camera (success=$sent, mid=${candidate.sdpMid})")
+            val key = candidateKeyOf(candidate)
+            if (!candidateDelivered.containsKey(key)) {
+                val typeMatch = Regex("typ\\s+(\\w+)").find(candidate.sdp)?.groupValues?.getOrNull(1) ?: "unknown"
+                AppLogger.d("ViewerMode", "Forwarding local ICE candidate to camera: mid=${candidate.sdpMid}, type=$typeMatch")
+                // false = dispatched but not yet confirmed; a failure leaves it
+                // false so the post-Answer pass retries exactly this one.
+                candidateDelivered[key] = false
+                localIceCandidates.add(candidate)
+                val iceMsg = SignalingMessage.IceCandidate(candidate.sdpMid, candidate.sdpMLineIndex, candidate.sdp)
+                effectScope.launch {
+                    val sent = signalingClient.sendSignalingMessage(targetCamera.deviceId, iceMsg, sharedKey)
+                    if (sent) candidateDelivered[key] = true
+                    AppLogger.d("ViewerMode", "Sent ICE candidate to camera (success=$sent, mid=${candidate.sdpMid})")
+                }
             }
         } ?: run {
             AppLogger.e("ViewerMode", "Failed creating PeerConnection for ${targetCamera.deviceId}")
@@ -304,11 +419,24 @@ fun ViewerModeScreen(
             return@LaunchedEffect
         }
 
-        // Explicit Unified Plan transceivers: Video (mid=0, RECV_ONLY), Audio (mid=1, SEND_RECV)
-        pc.addTransceiver(
-            MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO,
-            RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY)
-        )
+        // Explicit Unified Plan transceivers.
+        //
+        // MULTI-LENS: the camera may stream several physical lenses at once, each
+        // on its own video m-line. The viewer therefore declares a fixed number of
+        // RECV_ONLY video transceivers; the camera fills as many as it actually
+        // has. Both sides use the same mid ordering (video m-lines first, audio
+        // last), so the Nth video transceiver always corresponds to the Nth lens
+        // without any extra negotiation round trip.
+        //
+        // We only ever fill the FIRST slot (one lens at a time); the extra slots
+        // exist so an older multi-track sender can still be received.
+        repeat(MultiLensConstants.MAX_VIDEO_M_LINES) {
+            pc.addTransceiver(
+                MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO,
+                RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY)
+            )
+        }
+        AppLogger.i("ViewerMode", "Declared ${MultiLensConstants.MAX_VIDEO_M_LINES} RECV_ONLY video transceivers for multi-lens")
         val pttAudioTrack = webRtcManager.startViewerAudioCapture()
         if (pttAudioTrack != null) {
             pc.addTransceiver(
@@ -394,15 +522,19 @@ fun ViewerModeScreen(
                     attempt++
                     connectionProgress = connectionProgress.copy(attempt = attempt)
                     val elapsed = System.currentTimeMillis() - startTime
-                    val candidatesSnapshot = ArrayList(localIceCandidates)
-                    AppLogger.i("ViewerMode", "Waiting for camera answer (+${elapsed}ms); re-transmitting Offer (attempt #$attempt/${ViewerConnectionProgress.DEFAULT_MAX_ATTEMPTS}) and ${candidatesSnapshot.size} local ICE candidates...")
+                    // Only candidates whose send was never confirmed. Re-sending
+                    // the whole set on every retry tripled the signalling traffic
+                    // for no benefit — the camera already had the rest.
+                    val undelivered = localIceCandidates.filter { candidateDelivered[candidateKeyOf(it)] != true }
+                    AppLogger.i("ViewerMode", "Waiting for camera answer (+${elapsed}ms); re-transmitting Offer (attempt #$attempt/${ViewerConnectionProgress.DEFAULT_MAX_ATTEMPTS}) and ${undelivered.size}/${localIceCandidates.size} undelivered ICE candidate(s)...")
                     val offerMsg = SignalingMessage.Offer(offer.description)
                     val sent = signalingClient.sendSignalingMessage(targetCamera.deviceId, offerMsg, sharedKey)
                     AppLogger.i("ViewerMode", "Re-transmitted Offer (attempt #$attempt, sent=$sent)")
-                    candidatesSnapshot.forEach { cand ->
+                    undelivered.forEach { cand ->
                         launch {
                             val iceMsg = SignalingMessage.IceCandidate(cand.sdpMid, cand.sdpMLineIndex, cand.sdp)
                             val candSent = signalingClient.sendSignalingMessage(targetCamera.deviceId, iceMsg, sharedKey)
+                            if (candSent) candidateDelivered[candidateKeyOf(cand)] = true
                             AppLogger.d("ViewerMode", "Re-transmitted candidate to camera (success=$candSent, mid=${cand.sdpMid})")
                         }
                     }
@@ -414,7 +546,7 @@ fun ViewerModeScreen(
         }
 
         // Observe incoming messages
-        signalingClient.incomingMessages.collect { (senderId, msg) ->
+        signalingClient.incomingMessages.collect collectLoop@ { (senderId, msg) ->
             if (senderId == targetCamera.deviceId) {
                 when (msg) {
                     is SignalingMessage.CameraWaking -> {
@@ -426,6 +558,25 @@ fun ViewerModeScreen(
                         connectionProgress = connectionProgress.copy(isCameraWakingUp = true)
                     }
                     is SignalingMessage.Answer -> {
+                        // Idempotence guard.
+                        //
+                        // Entering the viewer used to create two PeerConnections
+                        // within ~100 ms, so the camera answered twice and the
+                        // second setRemoteDescription failed with
+                        // "Called in wrong state: stable". Harmless only by luck —
+                        // had they arrived reversed, the second (identical) SDP
+                        // would have been applied on top of a live session.
+                        // An Answer is only valid while we still hold a local offer.
+                        // A stale Answer (from an abandoned attempt) must never be
+                        // applied, even though it is perfectly valid SDP.
+                        val answerState = pc.signalingState()
+                        if (answerState != PeerConnection.SignalingState.HAVE_LOCAL_OFFER) {
+                            AppLogger.w(
+                                "ViewerMode",
+                                "Ignoring duplicate/late Answer: signalingState=$answerState"
+                            )
+                            return@collectLoop
+                        }
                         val now = System.currentTimeMillis()
                         val elapsed = now - startTime
                         val step2Dur = (now - stepStartTimeMs).coerceAtLeast(50L)
@@ -461,14 +612,25 @@ fun ViewerModeScreen(
                                         connectionState = ViewerConnectionState.StartingStream
                                     }
 
-                                    val candidatesSnapshot = ArrayList(localIceCandidates)
-                                    AppLogger.i("ViewerMode", "Camera answered: transmitting ${candidatesSnapshot.size} local ICE candidates...")
-                                    effectScope.launch {
-                                        candidatesSnapshot.forEach { cand ->
-                                            launch {
-                                                val iceMsg = SignalingMessage.IceCandidate(cand.sdpMid, cand.sdpMLineIndex, cand.sdp)
-                                                val candSent = signalingClient.sendSignalingMessage(targetCamera.deviceId, iceMsg, sharedKey)
-                                                AppLogger.d("ViewerMode", "Sent candidate on answer to camera (success=$candSent, mid=${cand.sdpMid})")
+                                    // Only the candidates that never reached the
+                                    // camera. This used to re-send all of them, so
+                                    // every candidate travelled twice even when the
+                                    // first send had succeeded.
+                                    val unconfirmed = localIceCandidates.filter {
+                                        candidateDelivered[candidateKeyOf(it)] != true
+                                    }
+                                    if (unconfirmed.isEmpty()) {
+                                        AppLogger.i("ViewerMode", "Camera answered: all ${localIceCandidates.size} local candidate(s) already delivered")
+                                    } else {
+                                        AppLogger.i("ViewerMode", "Camera answered: re-sending ${unconfirmed.size}/${localIceCandidates.size} unconfirmed candidate(s)")
+                                        effectScope.launch {
+                                            unconfirmed.forEach { cand ->
+                                                launch {
+                                                    val iceMsg = SignalingMessage.IceCandidate(cand.sdpMid, cand.sdpMLineIndex, cand.sdp)
+                                                    val candSent = signalingClient.sendSignalingMessage(targetCamera.deviceId, iceMsg, sharedKey)
+                                                    if (candSent) candidateDelivered[candidateKeyOf(cand)] = true
+                                                    AppLogger.d("ViewerMode", "Sent candidate on answer to camera (success=$candSent, mid=${cand.sdpMid})")
+                                                }
                                             }
                                         }
                                     }
@@ -482,8 +644,10 @@ fun ViewerModeScreen(
                         }, answerDesc)
                     }
                     is SignalingMessage.IceCandidate -> {
-                        val typeMatch = Regex("typ\\s+(\\w+)").find(msg.sdp)?.groupValues?.getOrNull(1) ?: "unknown"
-                        AppLogger.d("ViewerMode", "Received remote ICE candidate from camera: mid=${msg.sdpMid}, index=${msg.sdpMLineIndex}, type=$typeMatch")
+                        // No per-candidate log here: WebRtcManager records each one
+                        // (DEBUG) and the negotiated pair (INFO with a candidate
+                        // count). Logging it again in this layer only duplicated
+                        // the same lines across two tags.
                         val candidate = IceCandidate(msg.sdpMid, msg.sdpMLineIndex, msg.sdp)
                         webRtcManager.addRemoteIceCandidate(targetCamera.deviceId, candidate)
                     }
@@ -533,6 +697,39 @@ fun ViewerModeScreen(
                 is ControlCommand.TorchReport -> {
                     isTorchActive = cmd.enabled
                     AppLogger.i("ViewerMode", "Received TorchReport from camera: enabled=${cmd.enabled}")
+                }
+                is ControlCommand.LensListReport -> {
+                    // The camera published its lens list; apply it and adopt the
+                    // camera's active lens. A report is also an implicit answer to
+                    // a pending switch, so the button never stays greyed out.
+                    availableLenses = cmd.lenses
+                    webRtcManager.applyRemoteLensList(cmd.lenses, cmd.activeLensId)
+                    AppLogger.i("ViewerMode", "Received LensListReport: ${cmd.lenses.size} lens(es), active=${cmd.activeLensId}")
+                    if (pendingLensId != null) {
+                        val isPendingNowActive = pendingLensId == cmd.activeLensId
+                        val pendingGone = cmd.lenses.none { it.id == pendingLensId && it.available }
+                        if (isPendingNowActive || pendingGone) {
+                            settleLensSwitch(pendingLensId, "LensListReport(active=${cmd.activeLensId})")
+                        }
+                    }
+                }
+                is ControlCommand.LensSwitchResult -> {
+                    AppLogger.i(
+                        "ViewerMode",
+                        "Received LensSwitchResult: lens=${cmd.lensId}, status=${cmd.status}, " +
+                            "active=${cmd.activeLensId}, message=${cmd.message}"
+                    )
+                    settleLensSwitch(cmd.lensId, cmd.status)
+                    if (cmd.status == "FAILED") {
+                        android.widget.Toast.makeText(
+                            context,
+                            "镜头切换失败" + (cmd.message?.let { "：$it" } ?: ""),
+                            android.widget.Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+                is ControlCommand.SwitchLens -> {
+                    // Camera-side echo; nothing to do on the viewer.
                 }
                 else -> {}
             }
@@ -738,7 +935,16 @@ fun ViewerModeScreen(
                     .padding(16.dp),
                 verticalArrangement = Arrangement.SpaceBetween
             ) {
-                // Top Overlay
+                // Top overlay + dedicated lens switcher strip.
+                //
+                // The lens chips MUST NOT live inside the top bar's Row: that
+                // Row is fillMaxWidth + SpaceBetween and already carries the
+                // back button, device name, two battery readouts, night mode and
+                // torch. Adding 3-4 lens chips overflows it and Compose clips
+                // the trailing children — which is exactly why the switcher
+                // looked like it did not exist at all. A separate strip below
+                // the bar is always reachable.
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Surface(
                     color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.85f),
                     shape = RoundedCornerShape(24.dp)
@@ -913,6 +1119,60 @@ fun ViewerModeScreen(
                             }
                         }
                     }
+                }
+
+                // Lens switcher strip (scrollable so 4+ lenses never clip).
+                if (availableLenses.size > 1) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        availableLenses.forEach { lens ->
+                            val selected = lens.id == activeLensId
+                            val pending = lens.id == pendingLensId
+                            // A lens can be reported but fail to switch in (the
+                            // sensor refused to open). Keep the slot visible but
+                            // unselectable.
+                            val enabled = lens.available && pendingLensId == null
+                            Surface(
+                                color = when {
+                                    !lens.available -> Color.Black.copy(alpha = 0.25f)
+                                    pending -> MaterialTheme.colorScheme.secondary
+                                    selected -> MaterialTheme.colorScheme.primary
+                                    else -> Color.Black.copy(alpha = 0.55f)
+                                },
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable(enabled = enabled) { switchLens(lens.id) }
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    if (pending) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(12.dp),
+                                            strokeWidth = 1.5.dp,
+                                            color = Color.White
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                    }
+                                    Text(
+                                        text = if (lens.available) lens.label else "× ${lens.label}",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = when {
+                                            !lens.available -> Color.White.copy(alpha = 0.4f)
+                                            pending || selected -> MaterialTheme.colorScheme.onPrimary
+                                            else -> Color.White
+                                        },
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
                 }
 
                 // Bottom Action Row

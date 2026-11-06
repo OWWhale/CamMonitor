@@ -50,10 +50,11 @@
     <string name="camera_viewers_count">ビューアー %1$d/%2$d</string>
     <string name="camera_viewers_count_short">%1$d/%2$d</string>
     <string name="camera_intercom_live">インターホン通話中（ビューアーが発話中）</string>
+    <string name="camera_unlock_hint">スワイプしてロック解除</string>
     <string name="camera_black_screen">画面消灯</string>
     <string name="camera_exit_button">カメラを終了</string>
     <string name="camera_paused_title">カメラ一時停止中</string>
-    <string name="camera_paused_description">1分間ビューアーが接続されなかったため、バッテリー節約のためにカメラセンサーを停止しました。待機モード中です。ビューアーが接続すると、カメラは自動的に再開します。</string>
+    <string name="camera_paused_description">15秒間ビューアーが接続されなかったため、バッテリー節約のためにカメラセンサーを停止しました。待機モード中です。ビューアーが接続すると、カメラは自動的に再開します。</string>
 
     <!-- Viewer Mode Screen -->
     <string name="camera_default_name">カメラ</string>
@@ -106,14 +107,18 @@
     <string name="cd_pairing_qr_code">ペアリング用 QR コード</string>
     <string name="camera_pairing_otp_expires">OTP の有効期限まで %1$02d:%2$02d</string>
     <string name="camera_pairing_slot_available">空き枠 %1$d / %2$d</string>
+    <string name="camera_pairing_external_addr_label">サブネット外アドレス（任意）</string>
+    <string name="camera_pairing_external_addr_hint">空欄なら LAN のみ。ローカルアドレス: %1$s</string>
+    <string name="camera_pairing_external_addr_in_use">QR には %1$s も含まれます</string>
+    <string name="camera_pairing_external_addr_invalid">host:port 形式で入力してください（例: 10.20.30.40:5577）</string>
     <string name="camera_pairing_instructions">デバイス B で CamMonitor を開き、「ビューアーモードを開始」をタップしてこのコードをスキャンしてください。</string>
 
     <!-- Viewer Pairing Screen -->
     <string name="viewer_pairing_title">カメラの QR コードをスキャン</string>
     <string name="viewer_pairing_align_qr">QR コードを枠内に合わせてペアリングします</string>
     <string name="viewer_pairing_invalid_qr">CamMonitor の QR コードの形式が正しくありません</string>
-    <string name="viewer_pairing_connecting_broker">有効な QR コードを検出しました。シグナリングブローカーに接続しています...</string>
-    <string name="viewer_pairing_broker_failed">ブローカーへの接続に失敗しました。再試行しています...</string>
+    <string name="viewer_pairing_connecting_broker">有効な QR コードを検出しました。カメラへ直接接続しています（LAN）...</string>
+    <string name="viewer_pairing_broker_failed">カメラへの接続に失敗しました。再試行しています...</string>
     <string name="viewer_pairing_authenticating">%1$s と認証しています...</string>
     <string name="viewer_pairing_success">ペアリングに成功しました！ビューアーを開始しています...</string>
     <string name="viewer_pairing_timeout">ペアリングがタイムアウトしました。もう一度 QR コードを枠内に合わせて再試行してください。</string>
@@ -134,12 +139,15 @@
     <!-- Log Viewer Screen -->
     <string name="log_share_title">CamMonitor のログを共有</string>
     <string name="log_share_description">ログを共有</string>
+    <string name="log_level_verbose">詳細ログが有効です（デバッグ情報を含む）</string>
+    <string name="log_level_normal">標準ログ（タップで詳細ログ）</string>
     <string name="log_clear_description">ログを消去</string>
     <string name="log_filter_all">すべて</string>
 
     <!-- Language Picker -->
     <string name="language_picker_title">アプリの言語</string>
     <string name="language_system_default">システムのデフォルト</string>
+    <string name="language_simplified_chinese">简体中文</string>
     <string name="language_english">English</string>
     <string name="language_traditional_chinese">繁體中文（台灣）</string>
     <string name="language_japanese">日本語</string>
@@ -166,4 +174,34 @@
     <string name="permission_notification_reason">通知: カメラの監視をバックグラウンドで継続するために必要です。</string>
     <string name="permission_open_settings">設定を開く</string>
     <string name="permission_grant">許可する</string>
+    <!-- Network & signaling settings (LAN-first fork) -->
+    <string name="settings_title">ネットワーク設定</string>
+    <string name="settings_signaling_mode">シグナリング方式</string>
+    <string name="settings_mode_lan">LAN 直結（推奨）</string>
+    <string name="settings_mode_lan_desc">同じ LAN 内で直接シグナリングを交換し、インターネット接続は不要です。両端末が同じ Wi-Fi／テザリングに接続し、ルーターの AP 分離が無効であることを確認してください。</string>
+    <string name="settings_mode_mqtt">MQTT リレー</string>
+    <string name="settings_mode_mqtt_desc">シグナリングを MQTT broker 経由で中継します。ネットワークをまたいで利用可能ですが、接続可能な broker が必要です（下記で各自インポート）。</string>
+    <string name="settings_lan_section">LAN 直結</string>
+    <string name="settings_local_ip">この端末：%1$s</string>
+    <string name="settings_unknown_ip">アドレス取得不可</string>
+    <string name="settings_refresh">更新</string>
+    <string name="settings_lan_port">LAN 待ち受けポート</string>
+    <string name="settings_save">保存</string>
+    <string name="settings_lan_hint">自動探索が失敗する場合は、ルーターの AP 分離を無効化するか、下記でカメラのアドレスを手動入力してください。</string>
+    <string name="settings_manual_camera_addr">カメラの手動アドレス</string>
+    <string name="settings_camera_addr_label">%1$s のアドレス</string>
+    <string name="settings_manual_addr_hint">host:port 形式。カンマ区切りで 2 つ指定できます（先頭がローカル、次がサブネット外。例: 192.168.11.114:5577,10.20.30.40:5577）。自動探索が使えない場合に利用します。</string>
+    <string name="settings_mqtt_section">MQTT リレー Broker</string>
+    <string name="settings_mqtt_host">Broker ホスト</string>
+    <string name="settings_mqtt_port">Broker ポート</string>
+    <string name="settings_mqtt_tls">TLS を使用</string>
+    <string name="settings_mqtt_user">ユーザー名（任意）</string>
+    <string name="settings_mqtt_pass">パスワード（任意）</string>
+    <string name="settings_ice_section">STUN / TURN サーバー</string>
+    <string name="settings_ice_import_hint">サーバーは組み込まれていません。自前の coturn またはプロバイダー設定を JSON でインポート — { iceServers: [ { urls: [stun:host:port] }, { urls: [turn:host:port], username: u, credential: p } ], mqtt: { host: broker.example.net, port: 8883, tls: true } }</string>
+    <string name="settings_ice_import">インポート</string>
+    <string name="settings_ice_imported">インポート成功</string>
+    <string name="settings_ice_import_failed">インポート失敗：JSON が不正です</string>
+    <string name="settings_ice_empty">STUN/TURN は未設定です。LAN 直結では不要、リレーで NAT を越える場合は必要になることがあります。</string>
+    <string name="settings_ice_clear">クリア</string>
 </resources>

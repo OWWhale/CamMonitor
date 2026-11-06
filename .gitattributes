@@ -1,0 +1,13 @@
+# Keep the repository in LF; Windows scripts stay CRLF so they still run.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets: never convert or diff as text.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.apk  binary
+*.aar  binary
+*.jar  binary
+*.jks  binary

@@ -1,12 +1,11 @@
 package com.a0soft.gphone.camonitor.data.webrtc
 
 import android.content.Context
-import android.hardware.camera2.CameraCaptureSession
-import android.hardware.camera2.CameraDevice
-import android.hardware.camera2.CaptureRequest
 import android.os.Handler
-import android.util.Range
-import android.view.Surface
+import android.os.Looper
+import android.os.SystemClock
+import com.a0soft.gphone.camonitor.data.camera.LensStreamController
+import com.a0soft.gphone.camonitor.data.model.CameraLensInfo
 import com.a0soft.gphone.camonitor.data.model.ControlCommand
 import com.a0soft.gphone.camonitor.log.AppLogger
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -31,9 +30,27 @@ class WebRtcManager(private val context: Context) {
     val activeLocalVideoTrack: VideoTrack? get() = localVideoTrack
     private var audioSource: AudioSource? = null
     private var localAudioTrack: AudioTrack? = null
-    private var videoCapturer: VideoCapturer? = null
-    private var surfaceTextureHelper: SurfaceTextureHelper? = null
     private var localRenderer: SurfaceViewRenderer? = null
+
+    /**
+     * Single-path lens streaming.
+     *
+     * Only ONE physical lens is open at a time. The camera feeds a single
+     * [VideoSource]/[VideoTrack] that stays alive for the whole session; a lens
+     * switch tears only the sensor and its capture thread down and reopens another
+     * one against the SAME source. Consequences:
+     *
+     *  - the negotiated video m-line never changes → no renegotiation on switch;
+     *  - the encoder/ISP budget belongs to one lens, which is also what the
+     *    hardware can actually sustain (CameraX guarantees two concurrent use
+     *    cases, and vendor HALs often refuse a third physical camera).
+     */
+    private var lensController: LensStreamController? = null
+
+    private val _availableLenses = MutableStateFlow<List<CameraLensInfo>>(emptyList())
+    val availableLenses: StateFlow<List<CameraLensInfo>> = _availableLenses.asStateFlow()
+
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     // Active PeerConnections mapped by peerId (max 2 for PA)
     private val peerConnections = java.util.concurrent.ConcurrentHashMap<String, PeerConnection>()
@@ -66,6 +83,29 @@ class WebRtcManager(private val context: Context) {
     // Receiver state (PB & PA)
     private var remoteVideoTrack: VideoTrack? = null
     private var remoteAudioTrack: AudioTrack? = null
+
+    /**
+     * Multi-lens receiver state.
+     *
+     * [remoteVideoTracks] holds every incoming video track keyed by the transceiver
+     * mid it arrived on; [remoteLensByMid] maps that mid to the physical lens
+     * descriptor published by the camera.
+     */
+    private val remoteVideoTracks = java.util.concurrent.ConcurrentHashMap<String, VideoTrack>()
+    private val remoteLensByMid = java.util.concurrent.ConcurrentHashMap<String, CameraLensInfo>()
+    private val _remoteLenses = MutableStateFlow<List<CameraLensInfo>>(emptyList())
+    val remoteLenses: StateFlow<List<CameraLensInfo>> = _remoteLenses.asStateFlow()
+    private val _activeLensId = MutableStateFlow<String?>(null)
+    val activeLensId: StateFlow<String?> = _activeLensId.asStateFlow()
+
+    /**
+     * The camera may publish its lens list BEFORE the remote video tracks arrive
+     * (the DataChannel opens before/independently of onTrack). In that case the
+     * requested lens cannot be selected yet; remember it and retry on every
+     * incoming track instead of silently settling for whichever one arrived first.
+     */
+    @Volatile
+    private var pendingPreferredLensId: String? = null
     private val remoteAudioTracks = java.util.concurrent.ConcurrentHashMap<String, AudioTrack>()
     private val activePttPeers = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val _isPttReceiving = MutableStateFlow(false)
@@ -75,8 +115,25 @@ class WebRtcManager(private val context: Context) {
     @Volatile
     private var remoteVideoRotationDegrees: Int = 0
 
+    /** Diagnostic: counts frames that actually reach the renderer. */
+    private val renderedFrameCount = java.util.concurrent.atomic.AtomicInteger(0)
+    private val warnedNoRenderer = java.util.concurrent.atomic.AtomicBoolean(false)
+
     private val remoteVideoSink = VideoSink { frame ->
-        val renderer = remoteRenderer ?: return@VideoSink
+        val renderer = remoteRenderer
+        if (renderer == null) {
+            // A frame arriving with no renderer attached is exactly the
+            // "connected, audio only, black screen" failure. Report it once.
+            if (warnedNoRenderer.compareAndSet(false, true)) {
+                AppLogger.w(tag, "remoteVideoSink: frame dropped because remoteRenderer is null")
+            }
+            return@VideoSink
+        }
+        val n = renderedFrameCount.incrementAndGet()
+        if (n == 1 || n % 100 == 0) {
+            AppLogger.i(tag, "Remote frames delivered to renderer: $n " +
+                "(${frame.buffer.width}x${frame.buffer.height})")
+        }
         val userRot = remoteVideoRotationDegrees
         if (userRot == 0) {
             renderer.onFrame(frame)
@@ -91,11 +148,6 @@ class WebRtcManager(private val context: Context) {
     private var viewerAudioSource: AudioSource? = null
     private var viewerAudioTrack: AudioTrack? = null
     private var isPttActive = false
-
-    private val iceServers = listOf(
-        PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-        PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer()
-    )
 
     init {
         initPeerConnectionFactory()
@@ -125,9 +177,44 @@ class WebRtcManager(private val context: Context) {
 
     @Volatile
     private var isCameraCapturing = false
+
+    /**
+     * Guards against overlapping rebuilds.
+     *
+     * The health check at the top of [startCameraCapture] consults
+     * `lensController.isRunning`, but a just-created controller only becomes
+     * RUNNING when its async callback fires. Any call landing in that window —
+     * and on a reconnect burst there are several, 35 ms apart — saw "unhealthy"
+     * and tore down the pipeline its predecessor had only just built. That is the
+     * `rebuilding (hadTrack=true) -> rebuilding (hadTrack=true)` triple that
+     * produced a phantom "no camera could be opened" in the field log.
+     */
+    private val cameraStartLock = Any()
+    private var cameraStartStartedAt = 0L
+
+    private companion object {
+        /**
+         * Upper bound on how long a start may stay "in flight". If the controller
+         * callback never arrives, recovery must not be blocked forever.
+         */
+        const val CAMERA_START_GUARD_MS = 15_000L
+    }
+
+    /** @return true when this caller owns the rebuild and must release it. */
+    private fun beginCameraStart(): Boolean = synchronized(cameraStartLock) {
+        val now = SystemClock.elapsedRealtime()
+        val stillRunning = cameraStartStartedAt != 0L &&
+            now - cameraStartStartedAt < CAMERA_START_GUARD_MS
+        if (stillRunning) return false
+        cameraStartStartedAt = now
+        true
+    }
+
+    private fun endCameraStart() = synchronized(cameraStartLock) {
+        cameraStartStartedAt = 0L
+    }
     val isCameraCaptureActive: Boolean get() = isCameraCapturing
     var onCameraUnexpectedClosed: (() -> Unit)? = null
-    private var cameraXCapturer: com.a0soft.gphone.camonitor.data.camera.CameraXVideoCapturer? = null
 
     private val _isNightModeActive = MutableStateFlow(false)
     val isNightModeActive: StateFlow<Boolean> = _isNightModeActive.asStateFlow()
@@ -141,12 +228,11 @@ class WebRtcManager(private val context: Context) {
     )
     val nightModeSetting: StateFlow<com.a0soft.gphone.camonitor.data.model.NightModeSetting> = _nightModeSetting.asStateFlow()
 
-    val isNightExtensionSupported: Boolean
-        get() = cameraXCapturer?.isNightExtensionSupported ?: false
-
     fun setNightModeSetting(setting: com.a0soft.gphone.camonitor.data.model.NightModeSetting) {
         _nightModeSetting.value = setting
-        cameraXCapturer?.setNightModeSetting(setting)
+        // Stored on the controller as well, so a later lens switch reopens the new
+        // sensor with the same exposure mode instead of resetting to AUTO.
+        lensController?.setNightMode(setting)
         try {
             com.a0soft.gphone.camonitor.CamMonitorApp.instance.securityRepository.setNightModeSetting(setting)
         } catch (e: Exception) {
@@ -154,129 +240,278 @@ class WebRtcManager(private val context: Context) {
         }
     }
 
+    /**
+     * Tears the camera pipeline down.
+     *
+     * Ordering matters: the controller stops the frame flow synchronously before
+     * the VideoSource is disposed. Disposing the source while a capturer is still
+     * pushing frames is what made quick reconnect cycles hang or crash.
+     */
     private fun releaseCameraHardwareOnly() {
-        try {
-            isCameraCapturing = false
-            _isNightModeActive.value = false
-            cameraXCapturer = null
-            videoCapturer?.stopCapture()
-            videoCapturer?.dispose()
-            videoCapturer = null
+        isCameraCapturing = false
+        _isNightModeActive.value = false
+        _availableLenses.value = emptyList()
 
-            surfaceTextureHelper?.dispose()
-            surfaceTextureHelper = null
-
-            localRenderer?.let { localVideoTrack?.removeSink(it) }
-            localVideoTrack?.dispose()
-            localVideoTrack = null
-            videoSource?.dispose()
-            videoSource = null
-        } catch (e: Exception) {
-            AppLogger.e(tag, "Error releasing camera hardware only", e)
+        val controller = lensController
+        lensController = null
+        if (controller != null) {
+            runCatching { controller.stop() }
+            runCatching { controller.shutdown() }
         }
+
+        localRenderer?.let { renderer -> localVideoTrack?.removeSink(renderer) }
+        runCatching { localVideoTrack?.dispose() }
+        localVideoTrack = null
+        runCatching { videoSource?.dispose() }
+        videoSource = null
+        AppLogger.i(tag, "Camera hardware released")
     }
 
+    /**
+     * Starts (or revives) the camera pipeline.
+     *
+     * Idempotent, but the health pre-check is a REAL check: a non-null track plus
+     * a true flag can both survive a dead pipeline (camera service killed, sensor
+     * released by another app, encoder stalled). The old code trusted that flag,
+     * so every reconnect after such a failure was a silent no-op — "多次重连无响应".
+     */
+    @Synchronized
     fun startCameraCapture(width: Int = 1280, height: Int = 720, fps: Int = 20) {
         val factory = peerConnectionFactory ?: return
 
-        if (localVideoTrack != null && isCameraCapturing) return // Already running healthy
-
-        if (localVideoTrack != null && !isCameraCapturing) {
-            AppLogger.w(tag, "localVideoTrack existed but capturer was not active. Releasing and restarting camera hardware.")
-            releaseCameraHardwareOnly()
+        if (isCameraCapturing && localVideoTrack != null && lensController?.isRunning == true) {
+            AppLogger.i(tag, "startCameraCapture: pipeline already healthy (lens=${lensController?.activeLensId})")
+            return
         }
 
-        val capturer = com.a0soft.gphone.camonitor.data.camera.CameraXVideoCapturer(context, preferNightMode = true).apply {
-            onCameraError = { errorDescription ->
-                AppLogger.e(tag, "Camera error: $errorDescription")
-                val wasCapturing = isCameraCapturing
-                isCameraCapturing = false
-                if (wasCapturing) {
-                    onCameraUnexpectedClosed?.invoke()
-                }
-            }
-            onNightModeChanged = { active ->
-                _isNightModeActive.value = active
-                broadcastDataChannelCommand(
-                    ControlCommand.NightModeReport(
-                        mode = _nightModeSetting.value.name,
-                        isNightActive = active
-                    )
-                )
-            }
-            onFpsDetermined = { fps ->
-                _streamFps.value = fps
-                videoSource?.adaptOutputFormat(width, height, fps)
-                peerConnections.values.forEach { pc ->
-                    configureVideoSenders(pc)
-                }
-                broadcastDataChannelCommand(ControlCommand.FpsReport(fps))
-            }
+        // A rebuild in progress is not an unhealthy pipeline — it is an
+        // unfinished one. Coalesce instead of tearing it down; the in-flight
+        // start will report its own result to the owner.
+        if (!beginCameraStart()) {
+            AppLogger.i(tag, "startCameraCapture: rebuild already in flight, coalescing this request")
+            return
         }
-        capturer.setNightModeSetting(_nightModeSetting.value)
+
+        AppLogger.i(tag, "startCameraCapture: rebuilding pipeline (hadTrack=${localVideoTrack != null}, flag=$isCameraCapturing)")
         try {
-            capturer.setTorch(com.a0soft.gphone.camonitor.CamMonitorApp.instance.torchManager.isTorchOn.value)
-        } catch (_: Exception) {}
-        cameraXCapturer = capturer
-        _isNightModeActive.value = capturer.isNightModeActive
-        videoCapturer = capturer
-
-        val helper = SurfaceTextureHelper.create("CaptureThread", eglBase.eglBaseContext)
-        surfaceTextureHelper = helper
-        val vSource = factory.createVideoSource(capturer.isScreencast)
-        videoSource = vSource
-        vSource.adaptOutputFormat(width, height, capturer.finalFps)
-
-        capturer.initialize(helper, context, vSource.capturerObserver)
-        capturer.startCapture(width, height, fps)
-        isCameraCapturing = true
-        _streamFps.value = capturer.finalFps
-
-        val track = factory.createVideoTrack("CAM_VIDEO_TRACK", vSource).apply {
-            setEnabled(true)
+            buildCameraPipeline(factory, width, height, fps)
+        } catch (t: Throwable) {
+            // Any synchronous failure (native OOM on createVideoSource, a throwing
+            // track factory…) must release the coalescing gate, otherwise every
+            // start request for the next 15 seconds is silently swallowed.
+            endCameraStart()
+            AppLogger.e(tag, "startCameraCapture failed during setup", t)
         }
+    }
+
+    /**
+     * The synchronous half of a rebuild. Ends by posting work to the lens
+     * controller, whose callback releases the start gate via [endCameraStart].
+     */
+    private fun buildCameraPipeline(
+        factory: PeerConnectionFactory,
+        width: Int,
+        height: Int,
+        fps: Int
+    ) {
+        releaseCameraHardwareOnly()
+
+        val vSource = factory.createVideoSource(false)
+        videoSource = vSource
+        vSource.adaptOutputFormat(width, height, fps)
+
+        val track = factory.createVideoTrack("CAM_VIDEO_TRACK", vSource).apply { setEnabled(true) }
         localVideoTrack = track
         localRenderer?.let { track.addSink(it) }
 
-        // Setup audio
-        if (localAudioTrack == null) {
-            val audioConstraints = MediaConstraints().apply {
-                mandatory.add(MediaConstraints.KeyValuePair("googEchoCancellation", "true"))
-                mandatory.add(MediaConstraints.KeyValuePair("googAutoGainControl", "true"))
-                mandatory.add(MediaConstraints.KeyValuePair("googNoiseSuppression", "true"))
-            }
-            val aSource = factory.createAudioSource(audioConstraints)
-            audioSource = aSource
-            localAudioTrack = factory.createAudioTrack("CAM_AUDIO_TRACK", aSource).apply {
-                setEnabled(true)
+        val controller = LensStreamController(context = context, preferNightMode = true)
+        controller.onFpsDetermined = { determinedFps ->
+            _streamFps.value = determinedFps
+            runCatching { videoSource?.adaptOutputFormat(width, height, determinedFps) }
+            peerConnections.values.forEach { pc -> configureVideoSenders(pc) }
+            broadcastDataChannelCommand(ControlCommand.FpsReport(determinedFps))
+        }
+        controller.onNightModeChanged = { active ->
+            _isNightModeActive.value = active
+            broadcastDataChannelCommand(
+                ControlCommand.NightModeReport(_nightModeSetting.value.name, active)
+            )
+        }
+        // Callbacks arrive on the controller worker: hop to the main thread before
+        // touching StateFlow / DataChannel state.
+        controller.onLensListChanged = { mainHandler.post { publishLensList() } }
+        controller.onActiveLensChanged = { lensId ->
+            mainHandler.post {
+                _activeLensId.value = lensId
+                publishLensList()
             }
         }
-
-        // Re-attach to any active PeerConnections if they exist
-        peerConnections.values.forEach { pc ->
-            localVideoTrack?.let { vTrack ->
-                try {
-                    val videoSender = pc.senders?.firstOrNull {
-                        try {
-                            it.track()?.kind() == "video"
-                        } catch (e: Throwable) {
-                            false
-                        }
-                    }
-                    if (videoSender != null) {
-                        videoSender.setTrack(vTrack, false)
-                        configureVideoSender(videoSender)
-                    } else {
-                        val sender = pc.addTrack(vTrack, listOf("CAM_STREAM"))
-                        configureVideoSender(sender)
-                    }
-                } catch (e: Throwable) {
-                    AppLogger.w(tag, "Failed to re-attach video track to peer connection: ${e.message}")
+        // The streaming sensor died (camera service killed, another app grabbed
+        // it, HAL error). Clear the flag so the service's recovery hook can
+        // actually restart the pipeline instead of trusting a stale "capturing".
+        controller.onCameraLost = {
+            mainHandler.post {
+                if (lensController === controller) {
+                    isCameraCapturing = false
+                    AppLogger.w(tag, "Camera lost — requesting pipeline recovery")
+                    onCameraUnexpectedClosed?.invoke()
                 }
             }
         }
+        controller.setNightMode(_nightModeSetting.value)
+        runCatching {
+            controller.setTorch(com.a0soft.gphone.camonitor.CamMonitorApp.instance.torchManager.isTorchOn.value)
+        }
 
-        AppLogger.i(tag, "Camera capture started: ${width}x${height}@${fps}fps (back camera)")
+        lensController = controller
+        isCameraCapturing = true
+        setupLocalAudioTrack(factory)
+
+        // A rebuild creates a NEW VideoTrack. Peer connections created before the
+        // rebuild still hold the old (disposed) track, and the camera is the
+        // answerer so it cannot renegotiate on its own — without this swap every
+        // viewer would stay on a dead track after a recovery restart.
+        attachVideoTrackToExistingPeers(track)
+
+        controller.start(
+            observer = vSource.capturerObserver,
+            eglContext = eglBase.eglBaseContext,
+            width = width,
+            height = height,
+            fps = fps
+        ) { opened ->
+            // Release the coalescing gate on BOTH outcomes: a failed start must
+            // not block the recovery path that is about to retry it.
+            endCameraStart()
+            if (opened) {
+                AppLogger.i(tag, "Lens stream active: lens=${controller.activeLensId}")
+            } else {
+                AppLogger.e(tag, "Lens stream failed: no camera could be opened")
+                isCameraCapturing = false
+                // Let the owner retry with backoff instead of leaving the camera
+                // permanently dead until the process restarts.
+                onCameraUnexpectedClosed?.invoke()
+            }
+            publishLensList()
+        }
+    }
+
+    /**
+     * Points an already-negotiated peer connection at a freshly created track.
+     *
+     * Swapping the track does not change the SDP, so no renegotiation is needed.
+     * Only when a peer somehow has no video sender at all do we add a track —
+     * that DOES need renegotiation and is therefore logged loudly, because the
+     * camera cannot initiate one (it always answers).
+     */
+    private fun attachVideoTrackToExistingPeers(track: VideoTrack) {
+        peerConnections.forEach { (peerId, pc) ->
+            try {
+                val sender = pc.senders?.firstOrNull { s ->
+                    runCatching { s.track()?.kind() == "video" }.getOrDefault(false)
+                }
+                if (sender != null) {
+                    sender.setTrack(track, false)
+                    configureVideoSender(sender)
+                    AppLogger.i(tag, "Swapped camera track on existing peer $peerId")
+                } else {
+                    val newSender = pc.addTrack(track, listOf("CAM_STREAM"))
+                    configureVideoSender(newSender)
+                    AppLogger.w(tag, "Peer $peerId had no video sender; added one (renegotiation required)")
+                }
+            } catch (t: Throwable) {
+                AppLogger.w(tag, "Failed to swap camera track on peer $peerId: ${t.message}")
+            }
+        }
+    }
+
+    /** Creates the local audio track once, shared by every peer connection. */
+    private fun setupLocalAudioTrack(factory: PeerConnectionFactory) {
+        if (localAudioTrack != null) return
+        val audioConstraints = MediaConstraints().apply {
+            mandatory.add(MediaConstraints.KeyValuePair("googEchoCancellation", "true"))
+            mandatory.add(MediaConstraints.KeyValuePair("googAutoGainControl", "true"))
+            mandatory.add(MediaConstraints.KeyValuePair("googNoiseSuppression", "true"))
+        }
+        val aSource = factory.createAudioSource(audioConstraints)
+        audioSource = aSource
+        localAudioTrack = factory.createAudioTrack("CAM_AUDIO_TRACK", aSource).apply {
+            setEnabled(true)
+        }
+    }
+
+    /**
+     * Publishes the lens list + the currently streaming lens to every viewer.
+     *
+     * Single-path: the active lens is global (one sensor at a time), so there is
+     * no per-viewer mapping to compute and no mid bookkeeping.
+     */
+    private fun publishLensList() {
+        val controller = lensController
+        val lenses = controller?.lensList().orEmpty()
+        _availableLenses.value = lenses
+        if (lenses.isEmpty()) return
+        val activeId = controller?.activeLensId
+            ?: lenses.firstOrNull { it.isDefault }?.id
+            ?: lenses.first().id
+        val report = ControlCommand.LensListReport(lenses, activeId)
+        dataChannels.keys.forEach { peerId -> sendDataChannelCommand(peerId, report) }
+    }
+
+    /**
+     * Handles a viewer's lens switch request.
+     *
+     * Every request is answered — OK, ALREADY_ACTIVE, BUSY or FAILED. A silent
+     * refusal is what left the viewer's lens button permanently greyed out in the
+     * previous build. The lens list is broadcast before the result so a second
+     * viewer attached to the same camera also updates.
+     */
+    fun switchLens(lensId: String, requesterPeerId: String? = null) {
+        val controller = lensController
+        if (controller == null) {
+            AppLogger.w(tag, "switchLens($lensId) ignored: camera is not streaming")
+            requesterPeerId?.let {
+                sendDataChannelCommand(
+                    it,
+                    ControlCommand.LensSwitchResult(lensId, "FAILED", null, "camera not streaming")
+                )
+            }
+            return
+        }
+
+        AppLogger.i(tag, "Lens switch requested: $lensId (peer=$requesterPeerId, active=${controller.activeLensId})")
+        controller.switchTo(lensId) { outcome ->
+            mainHandler.post {
+                val active = controller.activeLensId
+                AppLogger.i(tag, "Lens switch result: ${outcome.lensId} -> ${outcome.status} " +
+                    "(active=$active, reason=${outcome.message})")
+                _activeLensId.value = active
+                publishLensList()
+                val target = requesterPeerId ?: dataChannels.keys.firstOrNull()
+                target?.let {
+                    sendDataChannelCommand(
+                        it,
+                        ControlCommand.LensSwitchResult(
+                            lensId = outcome.lensId,
+                            status = outcome.status.name,
+                            activeLensId = active,
+                            message = outcome.message
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    /** Sends the current lens list to a single viewer (called after its answer). */
+    fun publishLensListTo(peerId: String) {
+        val controller = lensController ?: return
+        val lenses = controller.lensList()
+        if (lenses.isEmpty()) return
+        val activeId = controller.activeLensId
+            ?: lenses.firstOrNull { it.isDefault }?.id
+            ?: lenses.first().id
+        sendDataChannelCommand(peerId, ControlCommand.LensListReport(lenses, activeId))
     }
 
     fun configureVideoSender(sender: RtpSender?) {
@@ -285,12 +520,19 @@ class WebRtcManager(private val context: Context) {
             val parameters = sender.parameters ?: return
             parameters.degradationPreference = RtpParameters.DegradationPreference.MAINTAIN_RESOLUTION
             if (parameters.encodings != null) {
+                // Single-path: one lens owns the whole uplink, so no per-lens split.
+                // 2.5 Mbps keeps the previous conservative LAN profile; the encoder
+                // is no longer shared between lenses, so the same cap now buys a
+                // noticeably cleaner 720p.
+                val maxBitrate = 2_500_000
+                val minBitrate = 800_000
                 parameters.encodings.forEach { encoding ->
                     encoding.scaleResolutionDownBy = 1.0
                     encoding.maxFramerate = _streamFps.value
-                    encoding.minBitrateBps = 800_000
-                    encoding.maxBitrateBps = 2_500_000
+                    encoding.minBitrateBps = minBitrate
+                    encoding.maxBitrateBps = maxBitrate
                 }
+                AppLogger.i(tag, "Video sender budget: min=${minBitrate}bps, max=${maxBitrate}bps (single lens)")
             }
             val result = sender.setParameters(parameters)
             AppLogger.i(tag, "Configured video sender parameters: degradationPreference=MAINTAIN_RESOLUTION, maxFramerate=${_streamFps.value}, result=$result")
@@ -304,20 +546,28 @@ class WebRtcManager(private val context: Context) {
         try {
             pc.senders?.forEach { sender ->
                 try {
-                    if (sender.track()?.kind() == "video") {
-                        configureVideoSender(sender)
-                    }
+                    // A sender whose peer connection was torn down mid-rebuild is
+                    // already disposed: it can neither be read nor configured, and
+                    // it is not coming back. Skipping is the correct behaviour —
+                    // the previous code let the exception escape the loop and
+                    // abandoned every remaining sender as well.
+                    val track = sender.track() ?: return@forEach
+                    if (track.kind() == "video") configureVideoSender(sender)
                 } catch (e: Throwable) {
-                    AppLogger.w(tag, "Failed checking sender track: ${e.message}")
+                    AppLogger.d(tag, "Skipping unusable video sender: ${e.message}")
                 }
             }
         } catch (e: Throwable) {
-            AppLogger.w(tag, "Failed to configure video senders: ${e.message}")
+            // The PeerConnection itself is closed/gone (normal during a rebuild).
+            AppLogger.d(tag, "configureVideoSenders skipped, peer connection unusable: ${e.message}")
         }
     }
 
     fun stopCameraCapture() {
         try {
+            // An explicit stop overrides any in-flight rebuild: without this the
+            // next start would be coalesced into a run that no longer exists.
+            endCameraStart()
             isCameraCapturing = false
             activePttPeers.clear()
             _isPttReceiving.value = false
@@ -345,68 +595,100 @@ class WebRtcManager(private val context: Context) {
     }
 
     fun setTorch(enabled: Boolean): Boolean {
-        cameraXCapturer?.let {
-            return it.setTorch(enabled)
+        // The torch lives on whatever sensor is streaming: CameraX exposes it
+        // through CameraControl, and the controller re-applies the last state on
+        // every lens switch.
+        val controller = lensController ?: return false
+        controller.setTorch(enabled)
+        val facing = controller.activeLensFacing
+        if (enabled && facing != null && facing != "back") {
+            // Keep the requested state (it applies once a back lens is selected)
+            // but say so, otherwise the UI claims a torch that cannot light up.
+            AppLogger.w(tag, "Torch requested on a $facing lens — no flash unit, state stored for the next back lens")
         }
-        val capturer = videoCapturer ?: return false
-        return try {
-            val cameraCapturerClass = capturer.javaClass.superclass ?: Class.forName("org.webrtc.CameraCapturer")
-            val sessionField = cameraCapturerClass.getDeclaredField("currentSession").apply {
-                isAccessible = true
-            }
-            val session = sessionField.get(capturer) ?: return false
-            val sessionClass = session.javaClass
-
-            val deviceField = sessionClass.getDeclaredField("cameraDevice").apply { isAccessible = true }
-            val sessionCaptureField = sessionClass.getDeclaredField("captureSession").apply { isAccessible = true }
-            val surfaceField = sessionClass.getDeclaredField("surface").apply { isAccessible = true }
-            val handlerField = sessionClass.getDeclaredField("cameraThreadHandler").apply { isAccessible = true }
-            val captureFormatField = sessionClass.getDeclaredField("captureFormat").apply { isAccessible = true }
-            val fpsUnitFactorField = sessionClass.getDeclaredField("fpsUnitFactor").apply { isAccessible = true }
-
-            val cameraDevice = deviceField.get(session) as? CameraDevice ?: return false
-            val captureSession = sessionCaptureField.get(session) as? CameraCaptureSession ?: return false
-            val surface = surfaceField.get(session) as? Surface ?: return false
-            val handler = handlerField.get(session) as? Handler ?: return false
-            val captureFormat = captureFormatField.get(session) as? CameraEnumerationAndroid.CaptureFormat
-            val fpsUnitFactor = fpsUnitFactorField.getInt(session)
-
-            handler.post {
-                try {
-                    val builder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
-                    if (captureFormat != null && fpsUnitFactor > 0) {
-                        val fpsRange = Range(
-                            captureFormat.framerate.min / fpsUnitFactor,
-                            captureFormat.framerate.max / fpsUnitFactor
-                        )
-                        builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
-                    }
-                    builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                    builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                    builder.set(CaptureRequest.CONTROL_AE_LOCK, false)
-                    builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
-                    if (enabled) {
-                        builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
-                    } else {
-                        builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
-                    }
-                    builder.addTarget(surface)
-                    captureSession.setRepeatingRequest(builder.build(), null, handler)
-                    AppLogger.i(tag, "Torch mode successfully updated on active Camera2Session: enabled=$enabled")
-                } catch (e: Exception) {
-                    AppLogger.e(tag, "Failed to update torch on active Camera2Session", e)
-                }
-            }
-            true
-        } catch (e: Exception) {
-            AppLogger.w(tag, "Failed accessing Camera2Session for torch: ${e.message}")
-            false
-        }
+        AppLogger.i(tag, "Torch $enabled applied to lens ${controller.activeLensId}")
+        return true
     }
 
     // ----------------------------------------------------
     // PEER CONNECTION MANAGEMENT
     // ----------------------------------------------------
+
+    /**
+     * Formats an ICE candidate's SDP attribute as `type=<t>, <proto> <ip>:<port>`.
+     *
+     * SDP layout: `candidate:<foundation> <component> <transport> <priority>
+     * <address> <port> typ <type> ...`. Only the first eight fields are needed;
+     * anything shorter is malformed and reported as unknown rather than throwing.
+     */
+    private fun describeCandidate(sdp: String): String {
+        val fields = sdp.substringAfter("candidate:", sdp).split(" ")
+        if (fields.size < 8) return "type=unknown"
+        return "type=${fields[7]}, ${fields[2]} ${fields[4]}:${fields[5]}"
+    }
+
+    /**
+     * Logs the ICE candidate pair that ended up carrying the media.
+     *
+     * On the viewer side the remote half is usually a *peer-reflexive* candidate:
+     * the camera's NAT-mapped address, learned from the incoming STUN request.
+     * That address is precisely what a firewall has to allow, so logging it here
+     * makes cross-subnet failures diagnosable from the log alone.
+     */
+    private fun logSelectedCandidatePair(pc: PeerConnection, peerId: String, attempt: Int = 0) {
+        try {
+            pc.getStats { report ->
+                val stats = report.statsMap
+                var chosen: RTCStats? = null
+                for (s in stats.values) {
+                    if (s.type != "candidate-pair") continue
+                    val m = s.members
+                    if (m["selected"] == true) { chosen = s; break }
+                    if (chosen == null && m["state"] == "succeeded" && m["nominated"] == true) chosen = s
+                }
+                val members = chosen?.members
+                if (members == null) {
+                    // Right after CONNECTED the stats report often does not carry a
+                    // candidate-pair yet. Retry once instead of leaving the single
+                    // most useful diagnostic blank.
+                    if (attempt == 0) {
+                        AppLogger.d(tag, "Selected ICE pair for $peerId: not in stats yet, retrying in 1500ms")
+                        mainHandler.postDelayed({
+                            if (peerConnections[peerId] === pc) {
+                                logSelectedCandidatePair(pc, peerId, attempt + 1)
+                            }
+                        }, 1_500L)
+                    } else {
+                        AppLogger.w(tag, "Selected ICE pair for $peerId: still absent from stats after retry")
+                    }
+                    return@getStats
+                }
+
+                fun describe(idKey: String): String {
+                    val id = members[idKey] as? String ?: return "?"
+                    val c = stats[id] ?: return "?"
+                    val type = c.members["candidateType"] ?: "?"
+                    val proto = c.members["protocol"] ?: "?"
+                    // Newer libwebrtc renamed the field from `ip` to `address`;
+                    // without the fallback the address came out as a bare "?" and
+                    // the log could not tell which NAT mapping to open.
+                    val addr = c.members["address"] ?: c.members["ip"] ?: "?"
+                    val port = c.members["port"] ?: "?"
+                    return "$type $proto $addr:$port"
+                }
+
+                val remoteCandidates = addedRemoteIceCandidates[peerId]?.size ?: 0
+                AppLogger.i(
+                    tag,
+                    "Selected ICE pair for $peerId: local[${describe("localCandidateId")}] " +
+                        "<-> remote[${describe("remoteCandidateId")}] " +
+                        "(remoteCandidates=$remoteCandidates)"
+                )
+            }
+        } catch (e: Throwable) {
+            AppLogger.w(tag, "Failed to read selected ICE pair for $peerId: ${e.message}")
+        }
+    }
 
     fun createPeerConnection(peerId: String, onIceCandidateGenerated: (IceCandidate) -> Unit): PeerConnection? {
         val factory = peerConnectionFactory ?: run {
@@ -414,17 +696,27 @@ class WebRtcManager(private val context: Context) {
             return null
         }
         closePeer(peerId, keepPendingCandidates = true)
-        AppLogger.i(tag, "Creating new PeerConnection for $peerId with ${iceServers.size} ICE servers")
+        AppLogger.i(tag, "Creating new PeerConnection for $peerId")
 
-        val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
+        val rtcConfig = PeerConnection.RTCConfiguration(emptyList()).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
         }
 
         val pc = factory.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
             override fun onIceCandidate(candidate: IceCandidate) {
-                val typeMatch = Regex("typ\\s+(\\w+)").find(candidate.sdp)?.groupValues?.getOrNull(1) ?: "unknown"
-                AppLogger.i(tag, "Local ICE Candidate generated for $peerId: type=$typeMatch, mid=${candidate.sdpMid}, index=${candidate.sdpMLineIndex}")
+                // Log the actual socket address, not just the candidate type.
+                //
+                // Media ports are chosen by libwebrtc and cannot be pinned from
+                // the Java layer, so a camera behind a NAT firewall has to have
+                // its *current* port allowed. Without the port in the log,
+                // diagnosing "video worked yesterday" means packet capture on a
+                // laptop. This line makes it a log grep.
+                AppLogger.i(
+                    tag,
+                    "Local ICE Candidate for $peerId: ${describeCandidate(candidate.sdp)} " +
+                        "(mid=${candidate.sdpMid}, index=${candidate.sdpMLineIndex})"
+                )
                 onIceCandidateGenerated(candidate)
             }
 
@@ -444,6 +736,15 @@ class WebRtcManager(private val context: Context) {
                 AppLogger.i(tag, "ConnectionChange for $peerId: $newState")
                 peerConnectionStates[peerId] = newState
                 _connectionState.value = newState
+                if (newState == PeerConnection.PeerConnectionState.CONNECTED) {
+                    // Record which address pair actually carries the media.
+                    // On the viewer side the remote half is a peer-reflexive
+                    // candidate, i.e. the camera's NAT-mapped address — the exact
+                    // ip:port that has to be allowed through the firewall. Printing
+                    // it turns "video is black again, go capture packets" into a
+                    // single log grep.
+                    peerConnections[peerId]?.let { logSelectedCandidatePair(it, peerId) }
+                }
                 if (newState == PeerConnection.PeerConnectionState.DISCONNECTED ||
                     newState == PeerConnection.PeerConnectionState.FAILED ||
                     newState == PeerConnection.PeerConnectionState.CLOSED
@@ -467,15 +768,46 @@ class WebRtcManager(private val context: Context) {
             override fun onTrack(transceiver: RtpTransceiver?) {
                 val track = transceiver?.receiver?.track()
                 if (track is VideoTrack) {
-                    AppLogger.i(tag, "Remote VideoTrack received: id=${track.id()}, state=${track.state()}, enabled=${track.enabled()}")
+                    val mid = transceiver?.mid ?: "unknown-$peerId"
+                    AppLogger.i(tag, "Remote VideoTrack received: id=${track.id()}, mid=$mid, state=${track.state()}, enabled=${track.enabled()}")
                     track.setEnabled(true)
-                    remoteVideoTrack?.let { oldTrack ->
-                        oldTrack.removeSink(remoteVideoSink)
+
+                    // Multi-lens: keep every incoming video track, keyed by mid.
+                    // The legacy single-lens path still mirrors into
+                    // remoteVideoTrack so the existing renderer code keeps working.
+                    remoteVideoTracks[mid] = track
+
+                    val knownLens = remoteLensByMid[mid]
+                    // The lens list normally arrives before any track. Honour the
+                    // deferred selection as soon as ITS track shows up, instead of
+                    // leaving the renderer stuck on whichever track arrived first.
+                    val pending = pendingPreferredLensId
+                    val switched = if (pending != null) {
+                        val ok = selectRemoteLens(pending)
+                        if (ok) pendingPreferredLensId = null
+                        ok
+                    } else {
+                        false
                     }
-                    remoteVideoTrack = track
-                    track.removeSink(remoteVideoSink)
-                    track.addSink(remoteVideoSink)
-                    AppLogger.i(tag, "Attached remote VideoTrack to remoteVideoSink (renderer attached=${remoteRenderer != null})")
+
+                    if (!switched) {
+                        val isFirstVideo = remoteVideoTrack == null
+                        if (isFirstVideo) {
+                            remoteVideoTrack = track
+                            track.addSink(remoteVideoSink)
+                            AppLogger.i(tag, "Attached first remote VideoTrack (mid=$mid) to remoteVideoSink")
+                        } else {
+                            // Additional lens: do NOT steal the sink. The active lens
+                            // keeps rendering; the viewer switches explicitly.
+                            AppLogger.i(tag, "Additional remote VideoTrack stored (mid=$mid, lens=${knownLens?.label ?: "?"}), sink not stolen")
+                        }
+                        // Do not claim the active lens while a deferred selection is
+                        // still pending — that would flip the UI highlight to the
+                        // first track that happened to arrive.
+                        if (knownLens != null && _activeLensId.value == null && pendingPreferredLensId == null) {
+                            _activeLensId.value = knownLens.id
+                        }
+                    }
                 } else if (track is AudioTrack) {
                     AppLogger.i(tag, "Remote AudioTrack received from $peerId: id=${track.id()}, state=${track.state()}")
                     remoteAudioTracks[peerId] = track
@@ -512,7 +844,8 @@ class WebRtcManager(private val context: Context) {
         })
 
         if (pc != null) {
-            // Attach local tracks if streaming as sender (PA)
+            // Sender (PA): exactly one video track. The negotiated m-line survives
+            // every lens switch, which is why a switch never renegotiates.
             localVideoTrack?.let { vTrack ->
                 val sender = pc.addTrack(vTrack, listOf("CAM_STREAM"))
                 configureVideoSender(sender)
@@ -529,8 +862,13 @@ class WebRtcManager(private val context: Context) {
 
     private fun setupDataChannel(peerId: String, dc: DataChannel) {
         dataChannels[peerId] = dc
+        // onStateChange() and the trailing call at the end of this function can
+        // both fire while the channel is OPEN. Without a guard every initial
+        // report (including LENS_LIST_REPORT) is delivered twice, which makes
+        // the viewer re-apply the lens list and re-bind its sink mid-stream.
+        val initialStatusSent = java.util.concurrent.atomic.AtomicBoolean(false)
         fun sendInitialStatusIfOpen() {
-            if (dc.state() == DataChannel.State.OPEN) {
+            if (dc.state() == DataChannel.State.OPEN && initialStatusSent.compareAndSet(false, true)) {
                 val isCamera = localVideoTrack != null
                 if (isCamera) {
                     try {
@@ -584,6 +922,23 @@ class WebRtcManager(private val context: Context) {
                         AppLogger.i(tag, "Sent initial TorchReport on DataChannel open to $peerId: enabled=$torchEnabled")
                     } catch (e: Exception) {
                         AppLogger.e(tag, "Failed to send initial TorchReport command", e)
+                    }
+
+                    // Publish the loaded lens list so the viewer knows which
+                    // lenses it can switch to right away.
+                    try {
+                        val lenses = lensController?.lensList().orEmpty()
+                        if (lenses.isNotEmpty()) {
+                            val activeId = lensController?.activeLensId
+                                ?: lenses.firstOrNull { it.isDefault }?.id
+                                ?: lenses.first().id
+                            val cmd = ControlCommand.LensListReport(lenses, activeId)
+                            val bytes = cmd.toJson().toByteArray(Charsets.UTF_8)
+                            dc.send(DataChannel.Buffer(ByteBuffer.wrap(bytes), false))
+                            AppLogger.i(tag, "Sent initial LensListReport on DataChannel open to $peerId: ${lenses.size} lens(es)")
+                        }
+                    } catch (e: Exception) {
+                        AppLogger.e(tag, "Failed to send initial LensListReport command", e)
                     }
                 }
             }
@@ -675,6 +1030,83 @@ class WebRtcManager(private val context: Context) {
             remoteRenderer = null
         }
         remoteVideoTrack?.removeSink(remoteVideoSink)
+    }
+
+    /**
+     * Applies the lens list published by the camera.
+     *
+     * Single-path senders stream ONE track that never changes, so the report is
+     * purely UI state: which lenses exist and which one is live right now. The
+     * report is authoritative — the viewer shows exactly what the camera says,
+     * including after a failed switch.
+     *
+     * Multi-track senders (an older build) additionally publish a mid per lens;
+     * when such mids are present the matching remote track is attached, which is
+     * why the sink-swap path below is kept.
+     */
+    fun applyRemoteLensList(lenses: List<CameraLensInfo>, activeLensId: String?) {
+        remoteLensByMid.clear()
+        lenses.forEach { lens ->
+            lens.mid?.let { mid -> remoteLensByMid[mid] = lens }
+        }
+        _remoteLenses.value = lenses
+        AppLogger.i(tag, "Remote lens list applied: ${lenses.size} lens(es), active=$activeLensId -> " +
+            lenses.joinToString { "${it.label}(${it.id},avail=${it.available})" })
+
+        val resolvedActive = activeLensId?.takeIf { id -> lenses.any { it.id == id && it.available } }
+            ?: lenses.firstOrNull { it.isDefault && it.available }?.id
+            ?: lenses.firstOrNull { it.available }?.id
+            ?: return
+
+        // The camera's active lens always wins: it is the only side that knows
+        // which sensor is actually feeding the track.
+        _activeLensId.value = resolvedActive
+        pendingPreferredLensId = null
+
+        // Multi-track compatibility: if this lens has a mid AND we hold that
+        // track, render it. Single-path returns false here and the already
+        // attached track keeps running, so this is a no-op.
+        selectRemoteLens(resolvedActive)
+    }
+
+    /**
+     * Attaches the remote track that belongs to [lensId], if the peer still
+     * publishes one track per lens.
+     *
+     * Single-path peers stream one track that never changes, so this returns
+     * false there and the already attached track keeps rendering — the caller
+     * must NOT treat false as a switch failure.
+     */
+    fun selectRemoteLens(lensId: String): Boolean {
+        val lens = _remoteLenses.value.firstOrNull { it.id == lensId }
+        if (lens == null) {
+            AppLogger.w(tag, "selectRemoteLens: unknown lens $lensId")
+            return false
+        }
+        if (!lens.available) {
+            AppLogger.w(tag, "selectRemoteLens: lens $lensId is unavailable on the camera")
+            return false
+        }
+        val mid = lens.mid
+        val track = mid?.let { remoteVideoTracks[it] }
+        if (track == null) {
+            // Expected on a single-path camera: no mid, one shared track.
+            AppLogger.d(tag, "selectRemoteLens: no dedicated track for lens $lensId (mid=$mid)")
+            return false
+        }
+
+        remoteVideoTrack?.let { oldTrack ->
+            if (oldTrack !== track) {
+                oldTrack.removeSink(remoteVideoSink)
+                AppLogger.i(tag, "selectRemoteLens: detached previous track from sink")
+            }
+        }
+        remoteVideoTrack = track
+        track.removeSink(remoteVideoSink)
+        track.addSink(remoteVideoSink)
+        _activeLensId.value = lensId
+        AppLogger.i(tag, "Switched remote lens to ${lens.label} (cameraId=$lensId, mid=$mid)")
+        return true
     }
 
     fun setRemoteAudioEnabled(enabled: Boolean) {
@@ -772,14 +1204,17 @@ class WebRtcManager(private val context: Context) {
         if (pc != null && isRemoteDescSet) {
             try {
                 val added = pc.addIceCandidate(candidate)
-                AppLogger.i(tag, "Added remote ICE candidate directly for $peerId: type=$typeMatch, mid=${candidate.sdpMid}, added=$added")
+                // Per-candidate detail is DEBUG: a single negotiation produces
+                // 30-50 of these and the camera re-sends each one. The INFO-level
+                // summary lives in logSelectedCandidatePair().
+                AppLogger.d(tag, "Added remote ICE candidate directly for $peerId: type=$typeMatch, mid=${candidate.sdpMid}, added=$added")
             } catch (e: Throwable) {
                 AppLogger.w(tag, "Failed adding candidate directly to pc for $peerId: ${e.message}")
             }
         } else {
             val list = pendingRemoteIceCandidates.getOrPut(peerId) { java.util.concurrent.CopyOnWriteArrayList() }
             list.add(candidate)
-            AppLogger.i(tag, "Buffered remote ICE candidate for $peerId: type=$typeMatch, mid=${candidate.sdpMid} (pending count=${list.size}, pc=${if (pc != null) "exists(waiting remoteDesc)" else "null"})")
+            AppLogger.d(tag, "Buffered remote ICE candidate for $peerId: type=$typeMatch, mid=${candidate.sdpMid} (pending count=${list.size}, pc=${if (pc != null) "exists(waiting remoteDesc)" else "null"})")
             if (remoteDescriptionSetPeers.contains(peerId)) {
                 drainRemoteIceCandidates(peerId)
             }
@@ -843,6 +1278,16 @@ class WebRtcManager(private val context: Context) {
         if (localVideoTrack == null || peerConnections.isEmpty()) {
             remoteVideoTrack?.removeSink(remoteVideoSink)
             remoteVideoTrack = null
+            // Drop every collected remote lens track as well, otherwise a
+            // reconnect would accumulate stale tracks and leak renderers.
+            remoteVideoTracks.values.forEach { track ->
+                runCatching { track.removeSink(remoteVideoSink) }
+            }
+            remoteVideoTracks.clear()
+            remoteLensByMid.clear()
+            _remoteLenses.value = emptyList()
+            _activeLensId.value = null
+            pendingPreferredLensId = null
         }
         remoteAudioTracks.remove(peerId)
         remoteAudioTrack = remoteAudioTracks.values.firstOrNull()
@@ -867,6 +1312,11 @@ class WebRtcManager(private val context: Context) {
         localRenderer?.let { r -> localVideoTrack?.removeSink(r) }
         remoteVideoTrack?.removeSink(remoteVideoSink)
         remoteVideoTrack = null
+        remoteVideoTracks.clear()
+        remoteLensByMid.clear()
+        _remoteLenses.value = emptyList()
+        _activeLensId.value = null
+        pendingPreferredLensId = null
         remoteRenderer = null
         remoteVideoRotationDegrees = 0
         remoteAudioTrack = null

@@ -1,6 +1,8 @@
 # CamMonitor
 
-> **Languages:** [English](README.md) | [繁體中文](README_TW.md) | [日本語](README_JA.md)  
+[![Version](https://img.shields.io/badge/version-1.0.8-orange.svg)](CHANGELOG.md) [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Android](https://img.shields.io/badge/Android-9.0%2B-brightgreen.svg)](https://developer.android.com/about/versions/pie)
+
+> **Languages:** [English](README.md) | [简体中文](README_CN.md) | [繁體中文](README_TW.md) | [日本語](README_JA.md)  
 > **Story:** [Why I Created This Project: A 40-Year Developer's Reflections on Building with AI](WhyCreateThisProject.md)
 
 ![CamMonitor Promo Banner](cammonitor_promo.jpg)
@@ -20,8 +22,8 @@ CamMonitor turns your spare Android phone into a private, zero-account home secu
   - 1 Camera can stream to up to **2 viewers** simultaneously.
   - 1 Viewer can pair with up to **8 different cameras** (e.g., Living Room, Front Door, Baby Nursery).
 - **Smart Battery & Screen Protection:**
-  - **OLED Black Screen:** Camera screen turns completely black after 1 minute of inactivity to prevent OLED burn-in and save power. Tap anywhere to wake.
-  - **Auto-Standby Mode:** If no viewers are watching for 1 minute, the camera sensor shuts down to preserve battery and automatically wakes when a viewer connects.
+  - **OLED Black Screen:** Tap the Black Screen button to switch the panel off and lock touch input in one step, saving power and preventing OLED burn-in. Swipe to unlock.
+  - **Auto-Standby Mode:** If no viewers are watching for 15 seconds, the camera sensor shuts down to preserve battery and automatically wakes when a viewer connects.
   - **Hardware Longevity & Anti-Overheating:** Deliberately avoids 24/7 continuous video recording and persistent AI object detection to prevent phone overheating, battery swelling, and camera sensor wear. (Users can use AI tools to add these functions if specifically needed).
 - **Remote Controls from Viewer:**
   - **3-Way Night Mode:** Switch between `Auto` (activates via ambient light sensor), `Night` (forced low-light enhancement), and `Normal`.
@@ -29,8 +31,9 @@ CamMonitor turns your spare Android phone into a private, zero-account home secu
   - **Push-to-Talk (PTT) Intercom:** Hold the microphone button on the viewer to speak through the camera phone.
   - **Orientation & Fit Controls:** Rotate incoming video in 90° increments ($0^\circ \to 90^\circ \to 180^\circ \to 270^\circ$) and toggle between Aspect Fit (full uncropped view) and Aspect Fill.
   - **Battery Monitoring:** View real-time battery percentages and charging statuses for both the camera and viewer devices.
+- **Multi-Lens Switching:** On phones with several cameras, the viewer can switch between 0.5x / 1x / 2x and the front camera at any time. The switch reuses the same video track, so the connection is never renegotiated.
 - **Local Diagnostics:** Built-in rolling log viewer with instant share/export for troubleshooting.
-- **Multi-Language:** English, Traditional Chinese (繁體中文), and Japanese (日本語).
+- **Multi-Language:** English, Simplified Chinese (简体中文), Traditional Chinese (繁體中文), and Japanese (日本語).
 
 ---
 
@@ -68,9 +71,9 @@ Before first use, pair your two devices:
 2. Mount or position your phone facing the area you want to monitor.
 3. **Screen Behavior:**
    - **HUD Overlay:** The top bar shows streaming resolution/FPS (`720p 15fps`), active viewer count (`0/2` in portrait, `0/2 Viewers` in landscape), Night mode status, and flashlight status.
-   - **OLED Black Screen:** After 60 seconds without touch, the display turns completely black to conserve power and protect the screen. **Tap anywhere on the screen** to turn the display back on.
-   - **Manual Black Screen:** Tap the **Black Screen** button at the bottom left anytime to turn off the display immediately.
-   - **Camera Standby:** If no viewer connects within 1 minute, the camera enters standby mode to save battery. It will wake up automatically as soon as a paired viewer connects.
+   - **Screen Stays On:** While streaming, the display is kept awake so the preview never dies mid-session.
+   - **Black Screen:** Tap the **Black Screen** button at the bottom left to switch the panel off and lock touch input in one step. **Swipe up** to unlock.
+   - **Camera Standby:** If no viewer connects within 15 seconds, the camera enters standby mode to save battery. It will wake up automatically as soon as a paired viewer connects.
 4. **To Exit:** Tap **Exit Camera** (or press the Back button and confirm).
 
 ---
@@ -104,7 +107,7 @@ Before first use, pair your two devices:
 
 ## Language & System Logs
 
-- **Change Language:** Tap the **Globe/Language** icon on the top-right of the Home screen to select between *System Default*, *English*, *繁體中文*, or *日本語*.
+- **Change Language:** Tap the **Globe/Language** icon on the top-right of the Home screen to select between *System Default*, *English*, *简体中文*, *繁體中文*, or *日本語*.
 - **System Logs:** Tap the **Document** icon on the top-right of the Home screen to view the connection and signaling diagnostic logs. Tap the Share icon to export the log file.
 
 ---
@@ -115,7 +118,7 @@ To prevent spare phones from overheating, battery degradation/swelling, and shor
 
 - **No Continuous Video Recording:** Keeping the camera sensor and video encoder constantly running generates significant heat and degrades the device and battery quickly.
 - **No On-Device Object / Motion Detection:** Continuous computer vision models require holding the camera sensor and NPU/CPU at high utilization indefinitely.
-- **Auto-Standby Power Conservation:** If no viewer is connected for 1 minute, the camera hardware shuts down completely and enters low-power standby until a viewer connects.
+- **Auto-Standby Power Conservation:** If no viewer is connected for 15 seconds, the camera hardware shuts down completely and enters low-power standby until a viewer connects.
 - **Adding These Features:** If your specific use case requires continuous recording or object detection, you can use AI coding tools to extend this open-source codebase (e.g. adding CameraX `VideoCapture` or MLKit object detection onto the existing pipeline).
 
 ---
