@@ -144,11 +144,20 @@ Every signaling envelope sent over the public MQTT broker is structured as:
   * Any legacy external logs under `context.getExternalFilesDir("logs")` are automatically purged on startup.
 * **Thread-Safe StateFlow:** In-memory diagnostic logs are updated atomically using a Compare-And-Swap (CAS) loop via `_logsFlow.update { ... }`.
 * **Rolling Policy:**
-  * Max file size: **2 MB** per file.
-  * File rotation: Keeps up to **3 rolling backups** (`cammonitor.log`, `cammonitor.1.log`, `cammonitor.2.log`).
-  * Total disk budget: Capped at **~6 MB** maximum.
+  * Max file size: **8 MB** per file.
+  * File rotation: Keeps up to **5 rolling backups** (`cammonitor.log`, `cammonitor.1.log` … `cammonitor.5.log`).
+  * Total disk budget: Capped at **~48 MB** maximum. The previous 2 MB × 4 policy held roughly eleven hours, so an overnight failure overwrote its own evidence.
+* **Write Path:**
+  * Entries are funnelled through a bounded `Channel` (capacity 4096) into a single writer coroutine holding a long-lived `BufferedWriter`, flushed every **32 lines** or after **1 s** idle. The previous implementation opened, wrote and closed the file once per line.
+  * `minLevel` filters what reaches the file; mandatory entries (session markers, crash traces) bypass the filter.
 * **Log Entry Format:**
-  `[2026-10-12 17:20:01.432] [INFO] [WebRTCManager] ICE connection state changed: CONNECTED`
+  `[2026-10-12 17:20:01.432] [+12.345s] [INFO] [WebRtcManager] [webrtc-signaling] ICE connection state changed: CONNECTED`
+  * The elapsed offset is relative to process start, so a stall reads as a gap in the numbers instead of requiring arithmetic across wall-clock timestamps.
+  * The thread name is recorded per entry. Without it, audio, signaling and camera work interleave in one file and cannot be told apart.
+* **Session Boundaries:**
+  * `=== SESSION START ===` / `=== SESSION END ===` bracket every run.
+  * On startup the previous run's tail (last 4 KB) is echoed into the new file, so a process that was killed rather than crashed still leaves its final state visible.
+  * An `UncaughtExceptionHandler` appends `=== SESSION END === (crash)` with the stack trace.
 
 ### 3.2 Key Events Logged
 1. **Signaling & MQTT:**
@@ -162,8 +171,8 @@ Every signaling envelope sent over the public MQTT broker is structured as:
    * Camera lifecycle events: Camera open, frame encoder initialization, sensor errors, torch toggles, ambient light sensor readings, and dynamic Night Extension rebinds (`ExtensionMode.NIGHT`).
 3. **Power & App Lifecycle:**
    * Foreground Service startup, shutdown, and notification bindings.
-   * OLED Black Screen activations, tap-to-wake events, and 60-second idle countdown triggers.
-   * 60s viewer absence camera release triggers.
+   * OLED Black Screen activations, swipe-to-unlock events (including gestures rejected inside the 300 ms lock gate), and idle countdown triggers.
+   * 15 s viewer absence camera release triggers.
 4. **DataChannel Messages:**
    * Inbound and outbound control messages (`TORCH`, `PTT_START`, `PTT_STOP`, `RENAME`, `BATTERY`, `QUERY_BATTERY`, `SET_NIGHT_MODE`, `NIGHT_MODE_REPORT`).
 
@@ -314,20 +323,24 @@ Every signaling envelope sent over the public MQTT broker is structured as:
 * **Hardware State:**
   * Window brightness set to `0.01f`.
   * Status bars and navigation bars completely hidden via `WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE`.
-* **Touch Interaction:**
-  * The entire screen has a `clickable` / `pointerInput` listener.
-  * A single tap instantly wakes the screen: restores standard brightness, reveals HUD controls, and resets the 60-second idle timer.
+* **Touch Interaction (Locked, Not Merely Dimmed):**
+  * Entering the black screen arms a touch guard: stray taps are consumed instead of waking the display or hitting whatever control sits under the finger. This is the difference between "the panel went dark" and "the phone is locked".
+  * Unlocking requires a deliberate swipe of at least `max(30% of screen width, 120 dp)`, performed at least **300 ms** after locking, so the gesture that locked the screen cannot immediately undo it.
+  * A dim `Swipe up to unlock` hint fades in after **1.5 s**. Unlocking restores brightness and starts a **3 s** cooldown during which the screen cannot be locked again.
+  * The system back key is swallowed while locked.
+* **Brightness:** `0.01f` while locked, `0.55f` in the unlocked preview, `BRIGHTNESS_OVERRIDE_NONE` on exit.
+* **Screen Awake:** `FLAG_KEEP_SCREEN_ON` is held for the whole streaming session, so the display never sleeps mid-stream. Turning the panel off is therefore always an explicit action, never a system timeout.
 * **Burn-in Protection:** No static persistent text is rendered.
 
-#### 5.3.3 Inactivity / Standby View (After 60s of 0 Viewers)
+#### 5.3.3 Inactivity / Standby View (After 15 s of 0 Viewers)
 * **Background:** Dark `#121212` background (Camera hardware completely closed and released).
 * **Center Card:**
   * Icon: `Icons.Default.PauseCircleOutline` (64dp, Warning Amber).
   * Title: `"Camera Paused"` (HeadlineSmall).
-  * Description: `"No viewers connected for 1 minute. Camera sensor stopped to preserve battery."` (BodyMedium).
+  * Description: `"No viewers connected for 15 seconds. Camera sensor stopped to preserve battery."` (BodyMedium).
   * Spacing: 24dp vertical gap.
 * **Actions (Vertical column):**
-  * `Button`: `"Start Camera Mode"` $\to$ Re-opens camera, restarts listener, resets 60s timer.
+  * `Button`: `"Start Camera Mode"` $\to$ Re-opens camera, restarts listener, resets the 15 s timer.
   * `OutlinedButton`: `"Exit Camera Mode"` $\to$ Terminates service, returns to Home.
 
 ---
@@ -587,13 +600,19 @@ flowchart LR
 
 ### 7.4 Per-App Language Preferences & Internationalization (i18n)
 * **Supported Languages:**
-  * **English (`en`):** Default resources declared in `res/values/strings.xml`.
+  * **English (`en`):** Default resources in `res/values/strings.xml`.
+  * **Simplified Chinese (`zh-CN` / `zh-Hans`):** Script-qualified resources in `res/values-b+zh+Hans/strings.xml`.
   * **Traditional Chinese (`zh-TW` / `zh-Hant`):** Script-qualified resources in `res/values-b+zh+Hant/strings.xml`.
+  * **Japanese (`ja`):** `res/values-ja/strings.xml`.
+  * The default resource set must stay English. Chinese in `values/` makes every unmatched locale fall back to Chinese, which is worse than an untranslated string.
 * **Resource Qualifier Architecture:**
-  * Uses the BCP-47 script qualifier `values-b+zh+Hant/` exclusively instead of regional qualifiers (`values-zh-rTW/`). On Android 9+ (`minSdk = 28`), BCP-47 matching automatically resolves Traditional Chinese strings for users across Taiwan (`zh-TW`), Hong Kong (`zh-HK`), Macau (`zh-MO`), and generic Traditional Chinese setups without duplicating XML files.
-* **Dual Language Configuration Surfaces:**
-  1. **System "App languages" Setting (Android 13+ / API 33+):** Configured via `android:localeConfig="@xml/locales_config"` in `AndroidManifest.xml` with `<locale-config>` declaring `en` and `zh-TW`.
-  2. **In-App Language Picker:** Dropdown selector located directly in the Home Screen top app bar (`Icons.Default.Language`) enabling instant switching between `"Follow System"`, `"English"`, and `"繁體中文"`.
+  * Uses BCP-47 script qualifiers (`values-b+zh+Hans/`, `values-b+zh+Hant/`) instead of regional ones (`values-zh-rTW/`). On Android 9+ (`minSdk = 28`), BCP-47 matching resolves the correct script for `zh-CN`, `zh-SG`, `zh-Hans`, `zh-TW`, `zh-HK` and `zh-MO` without duplicating XML files.
+* **Chinese Tag Normalisation (`LocaleHelper.normalizeChineseTag`):**
+  * Every Chinese tag maps to exactly one script variant: a `hant` subtag, or a `-TW` / `-HK` / `-MO` region, resolves to Traditional; everything else (`zh`, `zh-CN`, `zh-SG`, `zh-Hans`) resolves to Simplified.
+  * Collapsing all `zh*` tags to `zh-TW` — the previous behaviour — makes Simplified unreachable on mainland devices even when the resources are present.
+* **Language Configuration Surfaces:**
+  1. **System "App languages" Setting (Android 13+ / API 33+):** Configured via `android:localeConfig="@xml/locales_config"`. `<locale-config>` must list all four tags (`en`, `zh-CN`, `zh-TW`, `ja`); a missing entry hides the language from the system picker even though the strings exist.
+  2. **In-App Language Picker:** Home Screen top app bar (`Icons.Default.Language`), offering `"Follow System"`, `"简体中文"`, `"繁體中文"`, `"English"` and `"日本語"`.
 * **Dynamic Application & Service Locale Propagation (`LocaleHelper`):**
   * Android's standard `AppCompatDelegate.setApplicationLocales()` and `LocaleManager.setApplicationLocales()` recreate UI activities, but do not automatically refresh the process-level `Application` singleton or background Services.
   * To guarantee that string resource lookups through `CamMonitorApp.instance.getString(...)` and `CameraMonitorService` foreground notifications resolve immediately to the selected language:
@@ -714,3 +733,13 @@ To validate regression-free operation between physical devices, an automated tes
 5. **Report Generation:** Summarizes test results with pass/fail metrics.
 
 
+
+---
+
+### 8.4 Continuous Integration (`/.github/workflows/android.yml`)
+
+* Runs on every push to `main` or a `feat/**` branch, on every pull request, and on manual dispatch.
+* JDK 21 (Temurin) with the Gradle cache enabled: `./gradlew :app:assembleDebug` followed by `./gradlew :app:testDebugUnitTest`.
+* The debug APK and the HTML test report are uploaded as artifacts (7-day retention), so a reviewer can inspect a pull request's build output without checking the branch out locally.
+* The Gradle wrapper is committed without the executable bit; the workflow grants it with `chmod +x` instead of changing the file mode in the repository.
+* Local baseline when this was written: **76 unit tests across 16 classes, all passing**.
